@@ -111,6 +111,12 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	if flags.NArg() != 0 {
 		return fmt.Errorf("usage: watchtower %s [options]", name)
 	}
+	listenWasSet := false
+	flags.Visit(func(selected *flag.Flag) {
+		if selected.Name == "listen" {
+			listenWasSet = true
+		}
+	})
 	resolvedAO, err := resolveAOExecutable(*aoExecutable)
 	if err != nil {
 		return err
@@ -118,7 +124,7 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	setupContext, cancel := context.WithTimeout(ctx, 90*time.Second)
 	state, statePath, created, err := onboarding.Setup(setupContext, onboarding.Options{
 		RepositoryPath: *repositoryPath, StateDirectory: *stateDirectory,
-		AOExecutable: resolvedAO, GHExecutable: *ghExecutable, Listen: *listen,
+		AOExecutable: resolvedAO, GHExecutable: *ghExecutable, Listen: *listen, OverrideListen: listenWasSet,
 	})
 	cancel()
 	if err != nil {

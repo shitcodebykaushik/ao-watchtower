@@ -99,6 +99,21 @@ func TestSetupCreatesProtectedReusableState(t *testing.T) {
 	if created || reusedPath != path || reused.AdminToken != state.AdminToken || commands.added {
 		t.Fatalf("reused=%#v path=%s created=%t", reused, reusedPath, created)
 	}
+
+	overridden, _, created, err := Setup(context.Background(), Options{
+		RepositoryPath: root, StateDirectory: stateDirectory, AOExecutable: "ao", GHExecutable: "gh",
+		Listen: "127.0.0.1:8888", OverrideListen: true, Commander: commands,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || overridden.Listen != "127.0.0.1:8888" || overridden.CallbackBaseURL != "http://127.0.0.1:8888" {
+		t.Fatalf("overridden=%#v created=%t", overridden, created)
+	}
+	persisted, err := Load(path)
+	if err != nil || persisted.Listen != overridden.Listen {
+		t.Fatalf("persisted=%#v err=%v", persisted, err)
+	}
 }
 
 func TestLoadRejectsExposedSecrets(t *testing.T) {

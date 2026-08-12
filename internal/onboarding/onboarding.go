@@ -72,6 +72,7 @@ type Options struct {
 	AOExecutable   string
 	GHExecutable   string
 	Listen         string
+	OverrideListen bool
 	Commander      Commander
 }
 
@@ -106,6 +107,13 @@ func Setup(ctx context.Context, options Options) (State, string, bool, error) {
 		}
 		if err := verifyExisting(ctx, options.Commander, state); err != nil {
 			return State{}, statePath, false, err
+		}
+		if options.OverrideListen && state.Listen != options.Listen {
+			state.Listen = options.Listen
+			state.CallbackBaseURL = "http://" + options.Listen
+			if err := Save(statePath, state); err != nil {
+				return State{}, statePath, false, err
+			}
 		}
 		return state, statePath, false, nil
 	} else if !os.IsNotExist(err) {
