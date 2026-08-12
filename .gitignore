@@ -1,4 +1,5 @@
 /ao-watchtower
+/watchtower
 /data/
 *.db
 *.db-shm

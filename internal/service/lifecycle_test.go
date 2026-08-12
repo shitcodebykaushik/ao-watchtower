@@ -198,6 +198,12 @@ func TestFixWithAORecordsApprovedSend(t *testing.T) {
 	if fake.sendCalls != 1 {
 		t.Fatalf("send calls=%d", fake.sendCalls)
 	}
+	if err := service.FixWithAO(context.Background(), reservation.TriggerKey); !errors.Is(err, ErrFixAlreadySent) {
+		t.Fatalf("duplicate FixWithAO=%v", err)
+	}
+	if fake.sendCalls != 1 {
+		t.Fatalf("duplicate send calls=%d", fake.sendCalls)
+	}
 	if count, _ := l.Count(context.Background(), "send_attempts"); count != 1 {
 		t.Fatalf("send attempts=%d", count)
 	}

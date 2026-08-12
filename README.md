@@ -56,22 +56,30 @@ Install the single binary:
 go install github.com/shitcodebykaushik/ao-watchtower/cmd/watchtower@latest
 ```
 
-Then enter any checked-out GitHub repository and run:
+Then enter any checked-out GitHub repository and choose a mode:
 
 ```sh
-watchtower up
+watchtower up              # review diagnoses in the dashboard
+watchtower up --auto-fix   # hands-free high-confidence code repairs
 ```
 
 On its first run, `up` performs `init` automatically. It detects the repository
 from `origin`, finds or registers the matching AO project, generates three
 independent secrets, creates a mode-`0600` state file under the user config
 directory, and starts the dashboard. It uses the authenticated `gh` CLI to poll
-open PR checks every 15 seconds, so local-first users do **not** need a public
+open PR checks every 5 seconds, so local-first users do **not** need a public
 server, tunnel, GitHub App, or manually configured webhook.
 
 The command prints the local dashboard URL and admin token. Keep the command in
 the foreground and press Ctrl+C to stop it. Later starts reuse the same private
 state and durable SQLite ledger.
+
+`--auto-fix` is an explicit repository-scoped approval. It automatically acts
+only on a schema-valid `code` diagnosis whose recommended action is `fix_code`,
+has concrete evidence, and meets the confidence threshold (80% by default).
+Infrastructure, flaky, test-only, configuration, dependency, unknown, malformed,
+and low-confidence diagnoses still stop for human review. The global dashboard
+kill switch remains authoritative in both modes.
 
 ```sh
 watchtower init                 # set up without starting

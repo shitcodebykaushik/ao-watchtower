@@ -30,6 +30,12 @@ signed local deliveries and pass through the same normalization, durable ledger,
 policy, and idempotency boundary as remote GitHub webhooks. This removes tunnel
 and webhook setup without weakening the downstream automation controls.
 
+`watchtower up --auto-fix` records an explicit repository-scoped operator choice
+and automatically approves only schema-valid, evidence-bearing `code` diagnoses
+at or above the configured confidence threshold. The scoped AO instruction may
+test, commit, and non-force push to the already claimed PR branch, but may not
+create or merge a PR, take over ownership, or alter unrelated files.
+
 ## Structured diagnosis
 
 ```json

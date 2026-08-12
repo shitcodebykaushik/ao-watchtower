@@ -369,6 +369,17 @@ func (l *Ledger) StartSendAttempt(ctx context.Context, key domain.TriggerKey, se
 		return SendStart{}, err
 	}
 	defer tx.Rollback()
+	var existing string
+	err = tx.QueryRowContext(ctx, `SELECT outcome FROM send_attempts WHERE trigger_key=? AND outcome<>'blocked_kill_switch' ORDER BY id DESC LIMIT 1`, key).Scan(&existing)
+	if err == nil {
+		if err = tx.Commit(); err != nil {
+			return SendStart{}, err
+		}
+		return SendStart{}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return SendStart{}, err
+	}
 	disabled, err := automationDisabledTx(ctx, tx)
 	if err != nil {
 		return SendStart{}, err

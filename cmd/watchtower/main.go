@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/ao"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/automation"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/config"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/intake"
@@ -74,7 +75,7 @@ func runCLI(ctx context.Context, args []string, output io.Writer) error {
 			return fmt.Errorf("usage: watchtower demo")
 		}
 		configuration := demoConfig()
-		return serve(ctx, configuration, func(_ context.Context, _ http.Handler, address string) error {
+		return serve(ctx, configuration, func(_ context.Context, _ http.Handler, address string, _ *ledger.Ledger, _ *service.Lifecycle) error {
 			go demoDelivery("http://"+address+"/webhooks/github", configuration.WebhookSecret)
 			return nil
 		})
@@ -104,7 +105,10 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	aoExecutable := flags.String("ao", os.Getenv("WT_AO_EXECUTABLE"), "AO executable (auto-detected by default)")
 	ghExecutable := flags.String("gh", "gh", "GitHub CLI executable")
 	listen := flags.String("listen", config.DefaultListen, "dashboard listen address")
-	pollInterval := flags.Duration("poll-interval", 15*time.Second, "GitHub check interval")
+	pollInterval := flags.Duration("poll-interval", 5*time.Second, "GitHub check interval")
+	autoFix := flags.Bool("auto-fix", false, "automatically approve and publish high-confidence code fixes")
+	autoFixActor := flags.String("auto-fix-actor", "local-auto-fix", "approval identity used by --auto-fix")
+	minimumConfidence := flags.Float64("auto-fix-confidence", automation.DefaultMinimumConfidence, "minimum confidence for --auto-fix")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -150,13 +154,25 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	}
 	fmt.Fprintf(output, "Dashboard: http://%s\n", state.Listen)
 	fmt.Fprintf(output, "Admin token: %s\n", state.AdminToken)
-	fmt.Fprintf(output, "Monitoring GitHub every %s; press Ctrl+C to stop.\n", pollInterval.String())
-	return serve(ctx, configuration, func(runContext context.Context, handler http.Handler, _ string) error {
+	if *autoFix {
+		fmt.Fprintf(output, "Mode: AUTO-FIX (code diagnoses at or above %.0f%%)\n", *minimumConfidence*100)
+	} else {
+		fmt.Fprintln(output, "Mode: REVIEW (approve fixes in the dashboard; use --auto-fix for hands-free repair)")
+	}
+	fmt.Fprintf(output, "Monitoring GitHub every %s; keep this command running. Press Ctrl+C to stop.\n", pollInterval.String())
+	return serve(ctx, configuration, func(runContext context.Context, handler http.Handler, _ string, durable *ledger.Ledger, lifecycle *service.Lifecycle) error {
 		poller, err := polling.New(githubClient, state.Repository, []byte(state.WebhookSecret), handler, *pollInterval, log.Default())
 		if err != nil {
 			return err
 		}
 		go poller.Run(runContext)
+		if *autoFix {
+			controller, err := automation.New(durable, lifecycle, *autoFixActor, *minimumConfidence, time.Second, log.Default())
+			if err != nil {
+				return err
+			}
+			go controller.Run(runContext)
+		}
 		return nil
 	})
 }
@@ -224,7 +240,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, `AO Watchtower — supervised CI repair for AO
 
 Usage:
-  watchtower up [--repo PATH]       Set up if needed, then monitor
+  watchtower up [--auto-fix]        Set up if needed, then monitor
   watchtower init [--repo PATH]     Perform one-time local setup
   watchtower status [--repo PATH]   Show local status
   watchtower serve -config FILE     Run webhook/server configuration
@@ -245,7 +261,7 @@ func demoConfig() config.Config {
 	return c
 }
 
-type readyHook func(context.Context, http.Handler, string) error
+type readyHook func(context.Context, http.Handler, string, *ledger.Ledger, *service.Lifecycle) error
 
 func serve(ctx context.Context, c config.Config, ready readyHook) error {
 	if err := c.ValidateRuntime(); err != nil {
@@ -298,7 +314,7 @@ func serve(ctx context.Context, c config.Config, ready readyHook) error {
 		}
 	}()
 	if ready != nil {
-		if err := ready(ctx, hook, listener.Addr().String()); err != nil {
+		if err := ready(ctx, hook, listener.Addr().String(), l, life); err != nil {
 			_ = srv.Close()
 			return err
 		}
