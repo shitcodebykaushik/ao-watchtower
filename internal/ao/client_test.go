@@ -39,18 +39,30 @@ func newTestClient(t *testing.T, fake *fakeProcess) *Client {
 
 func TestClientBuildsDiscreteAOCommands(t *testing.T) {
 	fake := &fakeProcess{run: func(_ context.Context, stdout, _ io.Writer) error {
-		_, _ = io.WriteString(stdout, `[]`)
+		_, _ = io.WriteString(stdout, `{"projects":[{"id":"project-1","name":"Watchtower"}]}`)
 		return nil
 	}}
 	client := newTestClient(t, fake)
 
-	if _, err := client.ListProjects(context.Background()); err != nil {
+	projects, err := client.ListProjects(context.Background())
+	if err != nil {
 		t.Fatal(err)
+	}
+	if got, want := projects, []Project{{ID: "project-1", Name: "Watchtower"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("projects = %#v, want %#v", got, want)
 	}
 	assertCommand(t, fake, "/configured/ao", []string{"project", "ls", "--json"})
 
-	if _, err := client.ListLiveSessions(context.Background(), "project-1"); err != nil {
+	fake.run = func(_ context.Context, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, `{"data":[{"id":"session-1","projectId":"project-1","status":"running"}],"meta":{"nextCursor":null}}`)
+		return nil
+	}
+	sessions, err := client.ListLiveSessions(context.Background(), "project-1")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if got, want := sessions, []Session{{ID: "session-1", ProjectID: "project-1", Status: "running"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sessions = %#v, want %#v", got, want)
 	}
 	assertCommand(t, fake, "/configured/ao", []string{"session", "ls", "--project", "project-1", "--json"})
 
@@ -60,11 +72,15 @@ func TestClientBuildsDiscreteAOCommands(t *testing.T) {
 	assertCommand(t, fake, "/configured/ao", []string{"spawn", "--project", "project-1", "--name", "ci-investigator", "--claim-pr", "42", "--no-takeover", "--harness", "codex", "--prompt", "Investigate CI only."})
 
 	fake.run = func(_ context.Context, stdout, _ io.Writer) error {
-		_, _ = io.WriteString(stdout, `{"id":"session-1"}`)
+		_, _ = io.WriteString(stdout, `{"session":{"id":"session-1","projectId":"project-1","status":"running"}}`)
 		return nil
 	}
-	if _, err := client.InspectSession(context.Background(), "project-1", "session-1"); err != nil {
+	session, err := client.InspectSession(context.Background(), "project-1", "session-1")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if got, want := session, (Session{ID: "session-1", ProjectID: "project-1", Status: "running"}); got != want {
+		t.Fatalf("session = %#v, want %#v", got, want)
 	}
 	assertCommand(t, fake, "/configured/ao", []string{"session", "get", "session-1", "--project", "project-1", "--json"})
 

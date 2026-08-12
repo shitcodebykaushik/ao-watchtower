@@ -23,6 +23,22 @@ type Session struct {
 	Status    string `json:"status"`
 }
 
+// projectListResponse is the AO project ls JSON envelope.
+type projectListResponse struct {
+	Projects []Project `json:"projects"`
+}
+
+// sessionListResponse is the AO session ls JSON envelope. Meta is intentionally
+// omitted because Watchtower needs only the live-session records.
+type sessionListResponse struct {
+	Data []Session `json:"data"`
+}
+
+// sessionGetResponse is the AO session get JSON envelope.
+type sessionGetResponse struct {
+	Session *Session `json:"session"`
+}
+
 // InvestigatorRequest fixes the initial workflow to a Codex CI investigator.
 type InvestigatorRequest struct {
 	ProjectID  string
@@ -54,32 +70,38 @@ func NewClient(runner *Runner) (*Client, error) {
 }
 
 func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
-	var projects []Project
-	if err := c.runJSON(ctx, &projects, "project", "ls", "--json"); err != nil {
+	var response projectListResponse
+	if err := c.runJSON(ctx, &response, "project", "ls", "--json"); err != nil {
 		return nil, err
 	}
-	for index, project := range projects {
+	if response.Projects == nil {
+		return nil, fmt.Errorf("decode AO JSON: missing projects envelope")
+	}
+	for index, project := range response.Projects {
 		if strings.TrimSpace(project.ID) == "" {
 			return nil, fmt.Errorf("AO project %d has no id", index)
 		}
 	}
-	return projects, nil
+	return response.Projects, nil
 }
 
 func (c *Client) ListLiveSessions(ctx context.Context, projectID string) ([]Session, error) {
 	if strings.TrimSpace(projectID) == "" {
 		return nil, fmt.Errorf("AO project id is required")
 	}
-	var sessions []Session
-	if err := c.runJSON(ctx, &sessions, "session", "ls", "--project", projectID, "--json"); err != nil {
+	var response sessionListResponse
+	if err := c.runJSON(ctx, &response, "session", "ls", "--project", projectID, "--json"); err != nil {
 		return nil, err
 	}
-	for index, session := range sessions {
+	if response.Data == nil {
+		return nil, fmt.Errorf("decode AO JSON: missing session data envelope")
+	}
+	for index, session := range response.Data {
 		if strings.TrimSpace(session.ID) == "" {
 			return nil, fmt.Errorf("AO session %d has no id", index)
 		}
 	}
-	return sessions, nil
+	return response.Data, nil
 }
 
 func (c *Client) SpawnInvestigator(ctx context.Context, request InvestigatorRequest) (CommandResult, error) {
@@ -98,14 +120,14 @@ func (c *Client) InspectSession(ctx context.Context, projectID, sessionID string
 	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(sessionID) == "" {
 		return Session{}, fmt.Errorf("AO project and session ids are required")
 	}
-	var session Session
-	if err := c.runJSON(ctx, &session, "session", "get", sessionID, "--project", projectID, "--json"); err != nil {
+	var response sessionGetResponse
+	if err := c.runJSON(ctx, &response, "session", "get", sessionID, "--project", projectID, "--json"); err != nil {
 		return Session{}, err
 	}
-	if strings.TrimSpace(session.ID) == "" {
+	if response.Session == nil || strings.TrimSpace(response.Session.ID) == "" {
 		return Session{}, fmt.Errorf("AO session has no id")
 	}
-	return session, nil
+	return *response.Session, nil
 }
 
 // SendApprovedFollowup deliberately accepts only a caller that has already checked durable approval.
