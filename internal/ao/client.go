@@ -3,7 +3,9 @@ package ao
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -38,6 +40,19 @@ type sessionListResponse struct {
 type sessionGetResponse struct {
 	Session *Session `json:"session"`
 }
+
+var stableClaimConflictCode = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])PR_CLAIMED_BY_ACTIVE_SESSION(?:$|[^A-Za-z0-9_])`)
+
+const maxSpawnSuffix = 4096
+
+// ClaimConflictError means AO refused --claim-pr because another worker owns
+// the pull request. It is distinct from a generic command failure so callers
+// can audit the event as linked/skipped and, critically, never retry with a
+// takeover.
+type ClaimConflictError struct{ Cause error }
+
+func (e *ClaimConflictError) Error() string { return "AO pull request claim conflict" }
+func (e *ClaimConflictError) Unwrap() error { return e.Cause }
 
 // InvestigatorRequest fixes the initial workflow to a Codex CI investigator.
 type InvestigatorRequest struct {
@@ -114,6 +129,96 @@ func (c *Client) SpawnInvestigator(ctx context.Context, request InvestigatorRequ
 		"--claim-pr", strconv.FormatInt(request.PullNumber, 10),
 		"--no-takeover", "--harness", "codex", "--prompt", request.Prompt,
 	)
+}
+
+// SpawnInvestigatorSession performs the one allowed ownership-and-spawn
+// mutation. AO's --claim-pr --no-takeover flags are the sole ownership
+// authority; Watchtower never infers ownership from session listings.
+func (c *Client) SpawnInvestigatorSession(ctx context.Context, request InvestigatorRequest) (Session, error) {
+	if err := request.validate(); err != nil {
+		return Session{}, err
+	}
+	result, err := c.runner.Run(ctx,
+		"spawn", "--project", request.ProjectID,
+		"--name", investigatorName,
+		"--claim-pr", strconv.FormatInt(request.PullNumber, 10),
+		"--no-takeover", "--harness", "codex", "--prompt", request.Prompt,
+	)
+	if err != nil {
+		if isClaimConflict(result) {
+			return Session{}, &ClaimConflictError{Cause: err}
+		}
+		return Session{}, err
+	}
+	sessionID, status, err := parseSpawnedSession(result.Stdout)
+	if err != nil {
+		return Session{}, err
+	}
+	return Session{ID: sessionID, ProjectID: request.ProjectID, Status: status}, nil
+}
+
+// parseSpawnedSession accepts AO's documented text success line and no other
+// output shape. The output is already bounded by Runner; only a safe session
+// token is retained for durable linking.
+func parseSpawnedSession(output []byte) (string, string, error) {
+	line := strings.TrimSuffix(string(output), "\n")
+	line = strings.TrimSuffix(line, "\r")
+	if line == "" || strings.ContainsAny(line, "\r\n") {
+		return "", "", fmt.Errorf("parse AO spawn output: expected one spawned-session line")
+	}
+	const prefix = "spawned session "
+	if !strings.HasPrefix(line, prefix) {
+		return "", "", fmt.Errorf("parse AO spawn output: missing spawned-session line")
+	}
+	remainder := strings.TrimPrefix(line, prefix)
+	separator := strings.Index(remainder, " (")
+	if separator <= 0 {
+		return "", "", fmt.Errorf("parse AO spawn output: invalid session line")
+	}
+	sessionID := remainder[:separator]
+	afterID := remainder[separator+2:]
+	closing := strings.IndexByte(afterID, ')')
+	if closing <= 0 || !safeSessionToken(sessionID) {
+		return "", "", fmt.Errorf("parse AO spawn output: invalid session id")
+	}
+	status := afterID[:closing]
+	if !safeSessionToken(status) {
+		return "", "", fmt.Errorf("parse AO spawn output: invalid session status")
+	}
+	if suffix := afterID[closing+1:]; len(suffix) > maxSpawnSuffix {
+		return "", "", fmt.Errorf("parse AO spawn output: suffix exceeds limit")
+	}
+	return sessionID, status, nil
+}
+
+func safeSessionToken(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '_' || character == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// isClaimConflict recognizes only AO's stable no-takeover conflict code. AO
+// emits surrounding rollback prose, which is deliberately ignored.
+func isClaimConflict(result CommandResult) bool {
+	for _, source := range [][]byte{result.Stdout, result.Stderr} {
+		if stableClaimConflictCode.Match(source) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsClaimConflict lets the application classify a typed AO failure without
+// depending on process output or error strings.
+func IsClaimConflict(err error) bool {
+	var conflict *ClaimConflictError
+	return errors.As(err, &conflict)
 }
 
 func (c *Client) InspectSession(ctx context.Context, projectID, sessionID string) (Session, error) {

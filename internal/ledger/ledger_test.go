@@ -79,3 +79,38 @@ func TestRecordEvaluationDuplicateAndConcurrentReservation(t *testing.T) {
 		t.Fatalf("concurrent reservations=%d want 0", count)
 	}
 }
+
+func TestLifecycleFactsSurviveReopenAndBoundRawDiagnosis(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, evaluation := testFacts(t), testEval(t)
+	result, err := l.RecordEvaluation(context.Background(), domain.WebhookDelivery{ID: "delivery", PayloadDigest: "digest", ReceivedAt: time.Now()}, facts, evaluation)
+	if err != nil || !result.Reserved {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if err := l.SetAutomationDisabled(context.Background(), true, "operator", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordDiagnosis(context.Background(), result.TriggerKey, make([]byte, MaxDiagnosisRaw+1), nil, false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	disabled, err := l.AutomationDisabled(context.Background())
+	if err != nil || !disabled {
+		t.Fatalf("disabled=%v err=%v", disabled, err)
+	}
+	record, found, err := l.LatestDiagnosisRecord(context.Background(), result.TriggerKey)
+	if err != nil || !found || record.Valid || len(record.Raw) != MaxDiagnosisRaw {
+		t.Fatalf("record raw=%d valid=%v found=%v err=%v", len(record.Raw), record.Valid, found, err)
+	}
+}

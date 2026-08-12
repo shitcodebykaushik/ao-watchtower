@@ -165,8 +165,25 @@ func (d Diagnosis) Validate() error {
 	if strings.TrimSpace(d.Summary) == "" {
 		return fmt.Errorf("diagnosis summary is required")
 	}
+	if len(d.Summary) > 4096 {
+		return fmt.Errorf("diagnosis summary is too long")
+	}
 	if strings.TrimSpace(d.RecommendedAction) == "" {
 		return fmt.Errorf("diagnosis recommended action is required")
+	}
+	if len(d.RecommendedAction) > 128 {
+		return fmt.Errorf("diagnosis recommended action is too long")
+	}
+	if len(d.Evidence) > 32 {
+		return fmt.Errorf("diagnosis has too much evidence")
+	}
+	for index, evidence := range d.Evidence {
+		if evidence.Line < 0 || len(evidence.File) > 1024 || len(evidence.Check) > 1024 {
+			return fmt.Errorf("diagnosis evidence %d is invalid", index)
+		}
+		if strings.TrimSpace(evidence.File) == "" && strings.TrimSpace(evidence.Check) == "" {
+			return fmt.Errorf("diagnosis evidence %d has no observation", index)
+		}
 	}
 	return nil
 }

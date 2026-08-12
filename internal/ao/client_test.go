@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,6 +89,59 @@ func TestClientBuildsDiscreteAOCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCommand(t, fake, "/configured/ao", []string{"send", "--session", "session-1", "--message", "Human approved a scoped fix."})
+}
+
+func TestSpawnInvestigatorSessionParsesTextContractAndClaimConflict(t *testing.T) {
+	fake := &fakeProcess{run: func(_ context.Context, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "spawned session ao-123 (idle) (claimed https://github.com/o/r/pull/42) [prompt 100 B, system 200 B]\n")
+		return nil
+	}}
+	client := newTestClient(t, fake)
+	session, err := client.SpawnInvestigatorSession(context.Background(), InvestigatorRequest{ProjectID: "project-1", PullNumber: 42, Prompt: "Investigate CI only."})
+	if err != nil || session.ID != "ao-123" || session.Status != "idle" {
+		t.Fatalf("session=%#v err=%v", session, err)
+	}
+	assertCommand(t, fake, "/configured/ao", []string{"spawn", "--project", "project-1", "--name", "ci-investigator", "--claim-pr", "42", "--no-takeover", "--harness", "codex", "--prompt", "Investigate CI only."})
+
+	fake.run = func(_ context.Context, _, stderr io.Writer) error {
+		_, _ = io.WriteString(stderr, "spawn rolled back after claim failure: PR_CLAIMED_BY_ACTIVE_SESSION\n")
+		return errors.New("exit status 1")
+	}
+	_, err = client.SpawnInvestigatorSession(context.Background(), InvestigatorRequest{ProjectID: "project-1", PullNumber: 42, Prompt: "Investigate CI only."})
+	if !IsClaimConflict(err) {
+		t.Fatalf("error = %v, want typed claim conflict", err)
+	}
+}
+
+func TestSpawnInvestigatorSessionRejectsMalformedContract(t *testing.T) {
+	fake := &fakeProcess{run: func(_ context.Context, stdout, _ io.Writer) error {
+		_, _ = io.WriteString(stdout, "spawned session session/1 (running)\n")
+		return nil
+	}}
+	client := newTestClient(t, fake)
+	if _, err := client.SpawnInvestigatorSession(context.Background(), InvestigatorRequest{ProjectID: "project-1", PullNumber: 42, Prompt: "x"}); err == nil {
+		t.Fatal("SpawnInvestigatorSession() succeeded with unsafe session id")
+	}
+}
+
+func TestParseSpawnedSessionRejectsNewlinesAndOversizedSuffix(t *testing.T) {
+	for _, output := range []string{
+		"spawned session ao-123 (idle)\nextra",
+		"spawned session ao-123 (idle) " + strings.Repeat("x", maxSpawnSuffix+1),
+	} {
+		if _, _, err := parseSpawnedSession([]byte(output)); err == nil {
+			t.Fatalf("parseSpawnedSession(%q) succeeded", output[:min(len(output), 40)])
+		}
+	}
+}
+
+func TestClaimConflictRequiresExactStableCode(t *testing.T) {
+	if isClaimConflict(CommandResult{Stderr: []byte("XPR_CLAIMED_BY_ACTIVE_SESSION")}) {
+		t.Fatal("near-match conflict code was accepted")
+	}
+	if !isClaimConflict(CommandResult{Stderr: []byte("rollback: PR_CLAIMED_BY_ACTIVE_SESSION")}) {
+		t.Fatal("stable conflict code was not accepted")
+	}
 }
 
 func TestRunnerReturnsTypedTimeoutAndBoundedOutput(t *testing.T) {
