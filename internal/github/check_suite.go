@@ -12,7 +12,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 )
 
 const signaturePrefix = "sha256="

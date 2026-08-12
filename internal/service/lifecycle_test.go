@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/ao"
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
-	"github.com/agent-orchestrator/ao-watchtower/internal/ledger"
-	"github.com/agent-orchestrator/ao-watchtower/internal/policy"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/ao"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/policy"
 )
 
 type fakeAO struct {

@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/config"
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
-	"github.com/agent-orchestrator/ao-watchtower/internal/github"
-	"github.com/agent-orchestrator/ao-watchtower/internal/ledger"
-	"github.com/agent-orchestrator/ao-watchtower/internal/policy"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/config"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/github"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/policy"
 )
 
 const maxWebhookBody = 1 << 20

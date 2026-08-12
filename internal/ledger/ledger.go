@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
-	"github.com/agent-orchestrator/ao-watchtower/internal/policy"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/policy"
 	_ "modernc.org/sqlite"
 )
 

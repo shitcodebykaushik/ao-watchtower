@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 )
 
 const (

@@ -42,7 +42,58 @@ Watchtower owns automation policy and auditing. AO owns coding-agent sessions,
 isolated workspaces, provider authentication, and agent interaction.
 
 
-## Run locally
+## One-command local setup
+
+Prerequisites are deliberately limited to:
+
+- Agent Orchestrator running with a coding agent authenticated
+- `git` and an authenticated GitHub CLI (`gh auth login`)
+- Go 1.23+ when installing from source
+
+Install the single binary:
+
+```sh
+go install github.com/shitcodebykaushik/ao-watchtower/cmd/watchtower@latest
+```
+
+Then enter any checked-out GitHub repository and run:
+
+```sh
+watchtower up
+```
+
+On its first run, `up` performs `init` automatically. It detects the repository
+from `origin`, finds or registers the matching AO project, generates three
+independent secrets, creates a mode-`0600` state file under the user config
+directory, and starts the dashboard. It uses the authenticated `gh` CLI to poll
+open PR checks every 15 seconds, so local-first users do **not** need a public
+server, tunnel, GitHub App, or manually configured webhook.
+
+The command prints the local dashboard URL and admin token. Keep the command in
+the foreground and press Ctrl+C to stop it. Later starts reuse the same private
+state and durable SQLite ledger.
+
+```sh
+watchtower init                 # set up without starting
+watchtower up                   # set up if needed and monitor
+watchtower status               # show repository, AO mapping, and health
+watchtower help
+```
+
+Useful overrides are `--repo`, `--state-dir`, `--ao`, `--gh`, `--listen`, and
+`--poll-interval`. AO is auto-detected from `PATH` and standard desktop install
+locations. No AO private database or model-provider API key is accessed.
+
+For development from this checkout:
+
+```sh
+go run ./cmd/watchtower up --repo /absolute/path/to/your/repository
+```
+
+## Webhook/server mode
+
+Polling is the simplest local experience. A continuously reachable deployment
+can instead retain the original verified GitHub webhook mode.
 
 Create a JSON configuration file (secrets stay in the environment):
 
@@ -54,7 +105,7 @@ Create a JSON configuration file (secrets stay in the environment):
 export WT_WEBHOOK_SECRET='github-webhook-secret'
 export WT_CALLBACK_SECRET='separate-random-callback-secret'
 export WT_ADMIN_TOKEN='local-admin-token'
-go run ./cmd/watchtower -config ./watchtower.json
+go run ./cmd/watchtower serve -config ./watchtower.json
 ```
 
 The server defaults to `127.0.0.1:8787`; override it with `WT_LISTEN`. Other

@@ -1,4 +1,4 @@
-module github.com/agent-orchestrator/ao-watchtower
+module github.com/shitcodebykaushik/ao-watchtower
 
 go 1.23
 

@@ -1,18 +1,38 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/ao"
-	"github.com/agent-orchestrator/ao-watchtower/internal/config"
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
-	"github.com/agent-orchestrator/ao-watchtower/internal/intake"
-	"github.com/agent-orchestrator/ao-watchtower/internal/ledger"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/ao"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/config"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/intake"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
 )
+
+func TestHelpDocumentsOneCommandPath(t *testing.T) {
+	var output bytes.Buffer
+	if err := runCLI(context.Background(), []string{"help"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "watchtower up") {
+		t.Fatalf("help=%q", output.String())
+	}
+}
+
+func TestExplicitAOExecutableIsPreserved(t *testing.T) {
+	const executable = "/custom/ao"
+	got, err := resolveAOExecutable(executable)
+	if err != nil || got != executable {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
 
 func TestDemoUsesExplicitFakeBoundary(t *testing.T) {
 	got, e := demoAO{}.SpawnInvestigatorSession(context.Background(), ao.InvestigatorRequest{ProjectID: "p"})

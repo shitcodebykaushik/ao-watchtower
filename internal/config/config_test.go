@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 )
 
 func TestDefaultsAreValid(t *testing.T) {

@@ -2,8 +2,8 @@
 package policy
 
 import (
-	"github.com/agent-orchestrator/ao-watchtower/internal/config"
-	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/config"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 )
 
 const (

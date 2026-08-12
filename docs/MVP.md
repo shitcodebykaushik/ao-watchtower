@@ -20,6 +20,16 @@ before asking the AO worker to modify code.
 8. Watchtower records approval and sends a scoped fix instruction to that session.
 9. The agent pushes a fix and CI becomes green.
 
+## Local onboarding
+
+The default local experience is `watchtower up` from a GitHub checkout. It
+discovers the repository and public AO project through CLI contracts, stores
+private installation state with owner-only permissions, and polls PR check facts
+through the user's existing `gh` authentication. Poll results are converted into
+signed local deliveries and pass through the same normalization, durable ledger,
+policy, and idempotency boundary as remote GitHub webhooks. This removes tunnel
+and webhook setup without weakening the downstream automation controls.
+
 ## Structured diagnosis
 
 ```json
@@ -105,4 +115,3 @@ a shell.
 - Supporting every GitHub event
 - GitLab, Gitea, Jira, or Linear in the hackathon MVP
 - Hosted multi-tenant operation
-
