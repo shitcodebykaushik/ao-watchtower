@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,5 +213,23 @@ func TestSubmitDiagnosisRejectsTrailingMalformedData(t *testing.T) {
 	record, found, err := l.LatestDiagnosisRecord(context.Background(), reservation.TriggerKey)
 	if err != nil || !found || record.Valid {
 		t.Fatalf("record=%#v found=%v err=%v", record, found, err)
+	}
+}
+
+func TestCallbackTokenAndPromptAreScoped(t *testing.T) {
+	l, _, _ := newLifecycle(t)
+	fake := &fakeAO{}
+	s, err := NewLifecycle(l, fake, Options{CallbackBaseURL: "https://watchtower.example", CallbackSecret: []byte("callback")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, facts := reserve(t, l)
+	key, _ := domain.NewCIFailureTriggerKey(facts.Repository, facts.PullNumber, facts.HeadSHA)
+	token := s.CallbackToken(key)
+	if token == "" || !s.VerifyCallbackToken(key, token) || s.VerifyCallbackToken(key+"x", token) {
+		t.Fatal("callback token scope invalid")
+	}
+	if prompt := s.investigatorPrompt(facts, key); !strings.Contains(prompt, "action=diagnosis") || !strings.Contains(prompt, token) {
+		t.Fatal("callback instruction missing")
 	}
 }

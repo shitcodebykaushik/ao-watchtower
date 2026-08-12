@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"github.com/agent-orchestrator/ao-watchtower/internal/config"
+	"github.com/agent-orchestrator/ao-watchtower/internal/domain"
 	"github.com/agent-orchestrator/ao-watchtower/internal/ledger"
 	"net/http"
 	"net/http/httptest"
@@ -92,4 +93,46 @@ func TestHandlerRecordsNonFailureAndUnmapped(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Fatalf("reservations=%d err=%v", n, err)
 	}
+}
+
+type processor struct {
+	calls  int
+	result ledger.Result
+}
+
+func (p *processor) ProcessReservation(_ context.Context, r ledger.Result, _ domain.CheckSuiteFacts) error {
+	p.calls++
+	p.result = r
+	return nil
+}
+func TestHandlerDispatchesOnlyNewCommittedReservation(t *testing.T) {
+	l := newIntakeLedger(t)
+	defer l.Close()
+	repo, _ := domain.ParseRepository("octo/repo")
+	c := config.Defaults()
+	c.RepositoryProjects = []domain.RepositoryProject{{Repository: repo, AOProjectID: "p"}}
+	p := &processor{}
+	h, e := NewHandler([]byte("secret"), c, l, p)
+	if e != nil {
+		t.Fatal(e)
+	}
+	body := []byte(`{"action":"completed","repository":{"name":"repo","owner":{"login":"octo"}},"check_suite":{"id":1,"conclusion":"failure","head_sha":"abcdef0123456789","pull_requests":[{"number":2,"head":{"sha":"abcdef0123456789"}}]}}`)
+	for _, id := range []string{"one", "two"} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, signedRequest(t, []byte("secret"), body, id))
+		if w.Code != 202 {
+			t.Fatalf("code=%d", w.Code)
+		}
+	}
+	if p.calls != 1 || !p.result.Reserved {
+		t.Fatalf("calls=%d result=%#v", p.calls, p.result)
+	}
+}
+func newIntakeLedger(t *testing.T) *ledger.Ledger {
+	t.Helper()
+	l, e := ledger.Open(filepath.Join(t.TempDir(), "ledger.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	return l
 }

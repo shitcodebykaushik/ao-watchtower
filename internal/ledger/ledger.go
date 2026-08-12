@@ -458,11 +458,57 @@ func isUnique(err error) bool { return strings.Contains(err.Error(), "UNIQUE con
 // Count is a read-only test and future dashboard support query for durable facts.
 func (l *Ledger) Count(ctx context.Context, table string) (int, error) {
 	switch table {
-	case "webhook_deliveries", "spawn_reservations", "spawn_attempts", "diagnoses", "human_approvals", "send_attempts":
+	case "webhook_deliveries", "triggers", "spawn_reservations", "spawn_attempts", "diagnoses", "human_approvals", "send_attempts":
 	default:
 		return 0, fmt.Errorf("unsupported ledger table")
 	}
 	var count int
 	err := l.db.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count)
 	return count, err
+}
+
+// DashboardRow is a read model assembled solely from durable ledger facts.
+type DashboardRow struct {
+	TriggerKey, Repository, HeadSHA, Evaluation, ProjectID, SessionID, SpawnOutcome, Diagnosis, Approval, SendOutcome string
+	PullNumber                                                                                                        int64
+	CreatedAt                                                                                                         time.Time
+}
+type Dashboard struct {
+	AutomationDisabled                                bool
+	Deliveries, Triggers, Diagnoses, Approvals, Sends int
+	Rows                                              []DashboardRow
+}
+
+func (l *Ledger) Dashboard(ctx context.Context) (Dashboard, error) {
+	d := Dashboard{}
+	var err error
+	if d.AutomationDisabled, err = l.AutomationDisabled(ctx); err != nil {
+		return d, err
+	}
+	for _, x := range []struct {
+		n *int
+		t string
+	}{{&d.Deliveries, "webhook_deliveries"}, {&d.Triggers, "triggers"}, {&d.Diagnoses, "diagnoses"}, {&d.Approvals, "human_approvals"}, {&d.Sends, "send_attempts"}} {
+		if *x.n, err = l.Count(ctx, x.t); err != nil {
+			return d, err
+		}
+	}
+	rows, err := l.db.QueryContext(ctx, `SELECT COALESCE(e.trigger_key,''), f.owner||'/'||f.repo,f.pull_number,f.head_sha,e.outcome,COALESCE(e.ao_project_id,''),COALESCE(s.ao_session_id,''),COALESCE(s.outcome,''),COALESCE((SELECT structured_json FROM diagnoses d WHERE d.trigger_key=e.trigger_key AND d.valid=1 ORDER BY d.id DESC LIMIT 1),''),COALESCE((SELECT actor FROM human_approvals a WHERE a.trigger_key=e.trigger_key ORDER BY a.id DESC LIMIT 1),''),COALESCE((SELECT outcome FROM send_attempts z WHERE z.trigger_key=e.trigger_key ORDER BY z.id DESC LIMIT 1),''),w.received_at FROM evaluations e JOIN check_suite_facts f ON f.delivery_id=e.delivery_id JOIN webhook_deliveries w ON w.delivery_id=e.delivery_id LEFT JOIN spawn_attempts s ON s.trigger_key=e.trigger_key ORDER BY w.received_at DESC LIMIT 100`)
+	if err != nil {
+		return d, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r DashboardRow
+		var created string
+		if err = rows.Scan(&r.TriggerKey, &r.Repository, &r.PullNumber, &r.HeadSHA, &r.Evaluation, &r.ProjectID, &r.SessionID, &r.SpawnOutcome, &r.Diagnosis, &r.Approval, &r.SendOutcome, &created); err != nil {
+			return d, err
+		}
+		r.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return d, err
+		}
+		d.Rows = append(d.Rows, r)
+	}
+	return d, rows.Err()
 }

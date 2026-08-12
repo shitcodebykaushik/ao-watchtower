@@ -2,6 +2,7 @@
 package intake
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -20,13 +21,19 @@ import (
 const maxWebhookBody = 1 << 20
 
 type Handler struct {
-	secret []byte
-	config config.Config
-	ledger *ledger.Ledger
-	now    func() time.Time
+	secret    []byte
+	config    config.Config
+	ledger    *ledger.Ledger
+	now       func() time.Time
+	processor ReservationProcessor
 }
 
-func NewHandler(secret []byte, configuration config.Config, durableLedger *ledger.Ledger) (*Handler, error) {
+// ReservationProcessor runs only after a new reservation has committed.
+type ReservationProcessor interface {
+	ProcessReservation(context.Context, ledger.Result, domain.CheckSuiteFacts) error
+}
+
+func NewHandler(secret []byte, configuration config.Config, durableLedger *ledger.Ledger, processors ...ReservationProcessor) (*Handler, error) {
 	if len(secret) == 0 {
 		return nil, fmt.Errorf("webhook secret is required")
 	}
@@ -36,7 +43,14 @@ func NewHandler(secret []byte, configuration config.Config, durableLedger *ledge
 	if durableLedger == nil {
 		return nil, fmt.Errorf("ledger is required")
 	}
-	return &Handler{secret: append([]byte(nil), secret...), config: configuration, ledger: durableLedger, now: time.Now}, nil
+	var processor ReservationProcessor
+	if len(processors) > 1 {
+		return nil, fmt.Errorf("only one reservation processor is supported")
+	}
+	if len(processors) == 1 {
+		processor = processors[0]
+	}
+	return &Handler{secret: append([]byte(nil), secret...), config: configuration, ledger: durableLedger, now: time.Now, processor: processor}, nil
 }
 
 func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -74,10 +88,16 @@ func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request)
 		return
 	}
 	digest := sha256.Sum256(body)
-	_, err = h.ledger.RecordEvaluation(request.Context(), domain.WebhookDelivery{ID: deliveryID, PayloadDigest: hex.EncodeToString(digest[:]), ReceivedAt: h.now()}, facts, evaluation)
+	result, err := h.ledger.RecordEvaluation(request.Context(), domain.WebhookDelivery{ID: deliveryID, PayloadDigest: hex.EncodeToString(digest[:]), ReceivedAt: h.now()}, facts, evaluation)
 	if err != nil {
 		http.Error(response, "cannot record check suite event", http.StatusInternalServerError)
 		return
+	}
+	if result.Reserved && h.processor != nil {
+		if err := h.processor.ProcessReservation(request.Context(), result, facts); err != nil {
+			http.Error(response, "webhook accepted but processing failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	response.WriteHeader(http.StatusAccepted)
 }

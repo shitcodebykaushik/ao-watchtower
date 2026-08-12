@@ -114,3 +114,17 @@ func TestLifecycleFactsSurviveReopenAndBoundRawDiagnosis(t *testing.T) {
 		t.Fatalf("record raw=%d valid=%v found=%v err=%v", len(record.Raw), record.Valid, found, err)
 	}
 }
+
+func TestDashboardIncludesEvaluationWithoutTrigger(t *testing.T) {
+	l := newLedger(t)
+	facts := testFacts(t)
+	facts.Conclusion = "success"
+	_, err := l.RecordEvaluation(context.Background(), domain.WebhookDelivery{ID: "success", PayloadDigest: "digest", ReceivedAt: time.Now()}, facts, policy.Evaluation{RuleID: domain.InvestigateCIFailureRule, Outcome: policy.OutcomeNonFailure})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err := l.Dashboard(context.Background())
+	if err != nil || len(dashboard.Rows) != 1 || dashboard.Rows[0].TriggerKey != "" || dashboard.Rows[0].Evaluation != policy.OutcomeNonFailure {
+		t.Fatalf("dashboard=%#v err=%v", dashboard, err)
+	}
+}
