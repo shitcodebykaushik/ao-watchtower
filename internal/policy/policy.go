@@ -23,7 +23,7 @@ func EvaluateCheckSuite(facts domain.CheckSuiteFacts, configuration config.Confi
 	if err := facts.Validate(); err != nil {
 		return Evaluation{}, err
 	}
-	if facts.Conclusion == "failure" {
+	if facts.Conclusion != "failure" {
 		return Evaluation{RuleID: domain.InvestigateCIFailureRule, Outcome: OutcomeNonFailure}, nil
 	}
 	projectID, mapped := configuration.ProjectFor(facts.Repository)
