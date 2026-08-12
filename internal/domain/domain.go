@@ -187,3 +187,23 @@ type SendAttempt struct {
 	SentAt      time.Time  `json:"sentAt"`
 	Outcome     string     `json:"outcome"`
 }
+
+// Validate ensures normalized check-suite facts are safe to persist and evaluate.
+func (f CheckSuiteFacts) Validate() error {
+	if f.ProviderID <= 0 {
+		return fmt.Errorf("check suite id must be positive")
+	}
+	if err := f.Repository.Validate(); err != nil {
+		return fmt.Errorf("repository: %w", err)
+	}
+	if f.PullNumber <= 0 {
+		return fmt.Errorf("pull number must be positive")
+	}
+	if _, err := NewCIFailureTriggerKey(f.Repository, f.PullNumber, f.HeadSHA); err != nil {
+		return fmt.Errorf("head SHA: %w", err)
+	}
+	if strings.TrimSpace(f.Conclusion) == "" || strings.TrimSpace(f.Conclusion) != f.Conclusion {
+		return fmt.Errorf("check suite conclusion is required")
+	}
+	return nil
+}
