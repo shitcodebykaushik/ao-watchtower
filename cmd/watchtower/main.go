@@ -15,9 +15,14 @@ import (
 	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/intake"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/notify"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/onboarding"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/polling"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/prcomment"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/repopolicy"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/scheduler"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/service"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/verification"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/web"
 	"io"
 	"log"
@@ -31,6 +36,11 @@ import (
 	"syscall"
 	"time"
 )
+
+// Version is the build identity, overridable at link time with
+// -ldflags "-X main.Version=v1.2.3". A binary that cannot say what it is makes
+// an audit trail hard to trust.
+var Version = "dev"
 
 type demoAO struct{}
 
@@ -67,7 +77,7 @@ func runCLI(ctx context.Context, args []string, output io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return serve(ctx, configuration, nil)
+		return serve(ctx, configuration, runtimeOptions{}, nil)
 	}
 	switch args[0] {
 	case "demo":
@@ -75,7 +85,7 @@ func runCLI(ctx context.Context, args []string, output io.Writer) error {
 			return fmt.Errorf("usage: watchtower demo")
 		}
 		configuration := demoConfig()
-		return serve(ctx, configuration, func(_ context.Context, _ http.Handler, address string, _ *ledger.Ledger, _ *service.Lifecycle) error {
+		return serve(ctx, configuration, runtimeOptions{}, func(_ context.Context, _ http.Handler, address string, _ *ledger.Ledger, _ *service.Lifecycle) error {
 			go demoDelivery("http://"+address+"/webhooks/github", configuration.WebhookSecret)
 			return nil
 		})
@@ -85,6 +95,11 @@ func runCLI(ctx context.Context, args []string, output io.Writer) error {
 		return runInit(ctx, args[1:], output, true)
 	case "status":
 		return runStatus(ctx, args[1:], output)
+	case "stats":
+		return runStats(ctx, args[1:], output)
+	case "version", "--version":
+		fmt.Fprintf(output, "watchtower %s\n", Version)
+		return nil
 	case "help", "-h", "--help":
 		printUsage(output)
 		return nil
@@ -109,8 +124,15 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	autoFix := flags.Bool("auto-fix", false, "automatically approve and publish high-confidence code fixes")
 	autoFixActor := flags.String("auto-fix-actor", "local-auto-fix", "approval identity used by --auto-fix")
 	minimumConfidence := flags.Float64("auto-fix-confidence", automation.DefaultMinimumConfidence, "minimum confidence for --auto-fix")
+	comment := flags.Bool("comment", false, "publish the diagnosis and repair outcome as a pull request comment")
+	maxConcurrent := flags.Int("max-investigations", 3, "maximum concurrent AO investigator sessions; 0 means unlimited")
+	dailyFixBudget := flags.Int("daily-fix-budget", 20, "maximum automatic fixes dispatched per rolling 24 hours; 0 means unlimited")
+	verifyTimeout := flags.Duration("verify-timeout", verification.DefaultTimeout, "how long to watch a dispatched fix before recording it as unverified")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *maxConcurrent < 0 || *dailyFixBudget < 0 {
+		return fmt.Errorf("--max-investigations and --daily-fix-budget must not be negative")
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("usage: watchtower %s [options]", name)
@@ -152,22 +174,70 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	if err != nil {
 		return err
 	}
+	// A committed repository policy is loaded before anything starts. A policy
+	// that exists but cannot be parsed is fatal: an owner who wrote one must
+	// never be silently downgraded to permissive automation.
+	repositoryPolicy, err := repopolicy.Load(state.RepositoryPath)
+	if err != nil {
+		return err
+	}
+	mode := "review"
+	if *autoFix {
+		mode = "auto-fix"
+	}
 	fmt.Fprintf(output, "Dashboard: http://%s\n", state.Listen)
 	fmt.Fprintf(output, "Admin token: %s\n", state.AdminToken)
 	if *autoFix {
 		fmt.Fprintf(output, "Mode: AUTO-FIX (code diagnoses at or above %.0f%%)\n", *minimumConfidence*100)
+		fmt.Fprintf(output, "Limits: %s concurrent investigations, %s fixes per day\n", limitLabel(*maxConcurrent), limitLabel(*dailyFixBudget))
 	} else {
 		fmt.Fprintln(output, "Mode: REVIEW (approve fixes in the dashboard; use --auto-fix for hands-free repair)")
+		fmt.Fprintf(output, "Limits: %s concurrent investigations\n", limitLabel(*maxConcurrent))
+	}
+	if repositoryPolicy.AutoFix.Constrains() {
+		fmt.Fprintf(output, "Repository policy: %s applies\n", repopolicy.PolicyFileName)
+	}
+	if *comment {
+		fmt.Fprintln(output, "Pull request comments: enabled")
 	}
 	fmt.Fprintf(output, "Monitoring GitHub every %s; keep this command running. Press Ctrl+C to stop.\n", pollInterval.String())
-	return serve(ctx, configuration, func(runContext context.Context, handler http.Handler, _ string, durable *ledger.Ledger, lifecycle *service.Lifecycle) error {
-		poller, err := polling.New(githubClient, state.Repository, []byte(state.WebhookSecret), handler, *pollInterval, log.Default())
+	options := runtimeOptions{MaxConcurrentInvestigations: *maxConcurrent}
+	return serve(ctx, configuration, options, func(runContext context.Context, handler http.Handler, _ string, durable *ledger.Ledger, lifecycle *service.Lifecycle) error {
+		var notifier *notify.Controller
+		if *comment {
+			publisher, err := prcomment.NewPublisher(state.GHExecutable, nil)
+			if err != nil {
+				return err
+			}
+			notifier, err = notify.New(durable, publisher, mode, notify.Options{Logger: log.Default()})
+			if err != nil {
+				return err
+			}
+			go notifier.Run(runContext)
+		}
+		recorderOptions := verification.Options{Timeout: *verifyTimeout, Logger: log.Default()}
+		if notifier != nil {
+			recorderOptions.Notifier = notifier
+		}
+		recorder, err := verification.NewRecorder(durable, recorderOptions)
+		if err != nil {
+			return err
+		}
+		poller, err := polling.New(githubClient, state.Repository, []byte(state.WebhookSecret), handler, *pollInterval, log.Default(), polling.Options{Observer: recorder})
 		if err != nil {
 			return err
 		}
 		go poller.Run(runContext)
+		// The scheduler replays reservations that capacity or a restart left
+		// without a spawn attempt.
+		backlog, err := scheduler.New(durable, lifecycle, scheduler.Options{Interval: *pollInterval, Logger: log.Default()})
+		if err != nil {
+			return err
+		}
+		go backlog.Run(runContext)
 		if *autoFix {
-			controller, err := automation.New(durable, lifecycle, *autoFixActor, *minimumConfidence, time.Second, log.Default())
+			controller, err := automation.New(durable, lifecycle, *autoFixActor, *minimumConfidence, time.Second, log.Default(),
+				automation.Options{DailyFixBudget: *dailyFixBudget, Gate: policyGate{policy: repositoryPolicy, floor: *minimumConfidence}})
 			if err != nil {
 				return err
 			}
@@ -177,22 +247,36 @@ func runInit(ctx context.Context, args []string, output io.Writer, start bool) e
 	})
 }
 
+// policyGate adapts the committed repository policy to the automation gate.
+type policyGate struct {
+	policy repopolicy.Policy
+	floor  float64
+}
+
+func (g policyGate) AllowAutoFix(diagnosis domain.Diagnosis) (bool, string) {
+	decision := g.policy.EvaluateAutoFix(diagnosis, g.floor)
+	if decision.Allowed {
+		return true, decision.Reason
+	}
+	return false, decision.Reason + ": " + decision.Detail
+}
+
+func limitLabel(limit int) string {
+	if limit <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d", limit)
+}
+
 func resolveAOExecutable(requested string) (string, error) {
 	if requested != "" {
 		return requested, nil
 	}
-	if path, err := exec.LookPath("ao"); err == nil {
+	if path, err := exec.LookPath(aoExecutableName); err == nil {
 		return path, nil
 	}
-	candidates := []string{
-		"/usr/lib/agent-orchestrator/resources/daemon/ao",
-		"/Applications/Agent Orchestrator.app/Contents/Resources/daemon/ao",
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, filepath.Join(home, ".local", "bin", "ao"))
-	}
-	for _, candidate := range candidates {
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+	for _, candidate := range aoInstallCandidates() {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && isExecutableMode(info) {
 			return candidate, nil
 		}
 	}
@@ -210,20 +294,9 @@ func runStatus(ctx context.Context, args []string, output io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("usage: watchtower status [options]")
 	}
-	repository, _, err := onboarding.DiscoverRepository(ctx, onboarding.ExecCommander{}, *repositoryPath)
+	state, err := loadState(ctx, *repositoryPath, *stateDirectory)
 	if err != nil {
 		return err
-	}
-	directory := *stateDirectory
-	if directory == "" {
-		directory, err = onboarding.DefaultStateDirectory(repository)
-		if err != nil {
-			return err
-		}
-	}
-	state, err := onboarding.Load(filepath.Join(directory, "state.json"))
-	if err != nil {
-		return fmt.Errorf("Watchtower is not initialized; run `watchtower init`: %w", err)
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+state.Listen+"/healthz", nil)
@@ -236,6 +309,74 @@ func runStatus(ctx context.Context, args []string, output io.Writer) error {
 	return nil
 }
 
+// runStats prints the durable outcome record for a repository. It answers the
+// question a dashboard glance cannot: over time, is this automation actually
+// turning failed pull requests green?
+func runStats(ctx context.Context, args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("stats", flag.ContinueOnError)
+	flags.SetOutput(output)
+	repositoryPath := flags.String("repo", ".", "path inside the Git repository")
+	stateDirectory := flags.String("state-dir", "", "private state directory (advanced)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("usage: watchtower stats [options]")
+	}
+	state, err := loadState(ctx, *repositoryPath, *stateDirectory)
+	if err != nil {
+		return err
+	}
+	durable, err := ledger.Open(state.SQLitePath)
+	if err != nil {
+		return err
+	}
+	defer durable.Close()
+	stats, err := durable.Stats(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(output, "Repository: %s\n", state.Repository)
+	fmt.Fprintf(output, "Failures seen:        %d\n", stats.Triggers)
+	fmt.Fprintf(output, "Investigated:         %d (%d claim conflicts)\n", stats.Spawned, stats.ClaimConflicts)
+	fmt.Fprintf(output, "Valid diagnoses:      %d\n", stats.ValidDiagnoses)
+	fmt.Fprintf(output, "Approved:             %d\n", stats.Approvals)
+	fmt.Fprintf(output, "Fixes dispatched:     %d\n", stats.Dispatched)
+	fmt.Fprintf(output, "Verified green:       %d\n", stats.VerifiedGreen)
+	fmt.Fprintf(output, "Still failing:        %d\n", stats.StillFailing)
+	fmt.Fprintf(output, "Unverified:           %d (%d awaiting)\n", stats.Abandoned, stats.AwaitingVerification)
+	if settled := stats.VerifiedGreen + stats.StillFailing; settled > 0 {
+		fmt.Fprintf(output, "Repair success rate:  %.0f%%\n", stats.RepairSuccessRate()*100)
+	}
+	if stats.MedianTimeToGreen > 0 {
+		fmt.Fprintf(output, "Median time to green: %s\n", stats.MedianTimeToGreen.Round(time.Second))
+	}
+	if stats.AutomationDisabled {
+		fmt.Fprintln(output, "Automation:           KILL SWITCH ENABLED")
+	}
+	return nil
+}
+
+// loadState resolves the private installation state for a checkout.
+func loadState(ctx context.Context, repositoryPath, stateDirectory string) (onboarding.State, error) {
+	repository, _, err := onboarding.DiscoverRepository(ctx, onboarding.ExecCommander{}, repositoryPath)
+	if err != nil {
+		return onboarding.State{}, err
+	}
+	directory := stateDirectory
+	if directory == "" {
+		directory, err = onboarding.DefaultStateDirectory(repository)
+		if err != nil {
+			return onboarding.State{}, err
+		}
+	}
+	state, err := onboarding.Load(filepath.Join(directory, "state.json"))
+	if err != nil {
+		return onboarding.State{}, fmt.Errorf("Watchtower is not initialized; run `watchtower init`: %w", err)
+	}
+	return state, nil
+}
+
 func printUsage(output io.Writer) {
 	fmt.Fprintln(output, `AO Watchtower — supervised CI repair for AO
 
@@ -243,8 +384,10 @@ Usage:
   watchtower up [--auto-fix]        Set up if needed, then monitor
   watchtower init [--repo PATH]     Perform one-time local setup
   watchtower status [--repo PATH]   Show local status
+  watchtower stats [--repo PATH]    Show durable repair outcomes
   watchtower serve -config FILE     Run webhook/server configuration
-  watchtower demo                   Run the fake-boundary UI demo`)
+  watchtower demo                   Run the fake-boundary UI demo
+  watchtower version                Print the build version`)
 }
 
 func demoConfig() config.Config {
@@ -263,7 +406,14 @@ func demoConfig() config.Config {
 
 type readyHook func(context.Context, http.Handler, string, *ledger.Ledger, *service.Lifecycle) error
 
-func serve(ctx context.Context, c config.Config, ready readyHook) error {
+// runtimeOptions carries the operator limits that the lifecycle enforces. They
+// are separate from config.Config because they are process flags rather than
+// durable installation state.
+type runtimeOptions struct {
+	MaxConcurrentInvestigations int
+}
+
+func serve(ctx context.Context, c config.Config, options runtimeOptions, ready readyHook) error {
 	if err := c.ValidateRuntime(); err != nil {
 		return err
 	}
@@ -285,7 +435,11 @@ func serve(ctx context.Context, c config.Config, ready readyHook) error {
 			return x
 		}
 	}
-	life, e := service.NewLifecycle(l, client, service.Options{CallbackBaseURL: c.CallbackBaseURL, CallbackSecret: []byte(c.CallbackSecret)})
+	life, e := service.NewLifecycle(l, client, service.Options{
+		CallbackBaseURL:             c.CallbackBaseURL,
+		CallbackSecret:              []byte(c.CallbackSecret),
+		MaxConcurrentInvestigations: options.MaxConcurrentInvestigations,
+	})
 	if e != nil {
 		return e
 	}

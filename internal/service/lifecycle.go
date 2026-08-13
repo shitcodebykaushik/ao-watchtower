@@ -26,7 +26,21 @@ var (
 	ErrNoSession          = errors.New("no spawned AO session")
 	ErrAutomationDisabled = errors.New("automation is disabled")
 	ErrFixAlreadySent     = errors.New("fix was already dispatched")
+	// ErrDispatchFailed reports that the durable record was written but the fix
+	// never reached AO. Returning success here would tell an operator the repair
+	// was under way when nothing had been sent.
+	ErrDispatchFailed = errors.New("fix dispatch failed")
 )
+
+// recordFailedSend closes the attempt as failed and still reports the failure to
+// the caller, so a successful audit write is never mistaken for a successful
+// dispatch. A retry can be authorized afterwards.
+func (s *Lifecycle) recordFailedSend(ctx context.Context, key domain.TriggerKey, sessionID, detail string) error {
+	if err := s.ledger.CompleteSendAttempt(ctx, key, sessionID, "failed", detail, s.now()); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s", ErrDispatchFailed, detail)
+}
 
 // AOClient is intentionally limited to the two lifecycle mutations. Production
 // wiring supplies internal/ao.Client; tests supply a fake with no live services.
@@ -36,16 +50,22 @@ type AOClient interface {
 }
 
 type Lifecycle struct {
-	ledger          *ledger.Ledger
-	ao              AOClient
-	now             func() time.Time
-	callbackBaseURL string
-	callbackSecret  []byte
+	ledger                      *ledger.Ledger
+	ao                          AOClient
+	now                         func() time.Time
+	callbackBaseURL             string
+	callbackSecret              []byte
+	maxConcurrentInvestigations int
 }
 
 type Options struct {
 	CallbackBaseURL string
 	CallbackSecret  []byte
+	// MaxConcurrentInvestigations bounds how many AO investigator sessions may
+	// be in flight at once. Zero means unbounded, which preserves the original
+	// behaviour. Triggers held back keep their reservation and are replayed by
+	// the scheduler once capacity frees up.
+	MaxConcurrentInvestigations int
 }
 
 func NewLifecycle(durableLedger *ledger.Ledger, client AOClient, options ...Options) (*Lifecycle, error) {
@@ -59,7 +79,38 @@ func NewLifecycle(durableLedger *ledger.Ledger, client AOClient, options ...Opti
 	if len(options) == 1 {
 		option = options[0]
 	}
-	return &Lifecycle{ledger: durableLedger, ao: client, now: time.Now, callbackBaseURL: strings.TrimRight(option.CallbackBaseURL, "/"), callbackSecret: append([]byte(nil), option.CallbackSecret...)}, nil
+	if option.MaxConcurrentInvestigations < 0 {
+		return nil, fmt.Errorf("maximum concurrent investigations must not be negative")
+	}
+	return &Lifecycle{
+		ledger: durableLedger, ao: client, now: time.Now,
+		callbackBaseURL:             strings.TrimRight(option.CallbackBaseURL, "/"),
+		callbackSecret:              append([]byte(nil), option.CallbackSecret...),
+		maxConcurrentInvestigations: option.MaxConcurrentInvestigations,
+	}, nil
+}
+
+// ErrAtCapacity reports that the concurrent investigation limit held a reserved
+// trigger back. The reservation survives; the scheduler replays it later.
+var ErrAtCapacity = fmt.Errorf("investigation capacity reached: %w", domain.ErrInvestigationDeferred)
+
+// HasCapacity reports whether another investigator may start now.
+func (s *Lifecycle) HasCapacity(ctx context.Context) (bool, error) {
+	if s.maxConcurrentInvestigations <= 0 {
+		return true, nil
+	}
+	active, err := s.ledger.ActiveInvestigations(ctx)
+	if err != nil {
+		return false, err
+	}
+	return active < s.maxConcurrentInvestigations, nil
+}
+
+// ResumeDeferredSpawn starts an investigation for a trigger whose reservation
+// was committed earlier but never reached AO, either because capacity was full
+// or because the process stopped mid-flight.
+func (s *Lifecycle) ResumeDeferredSpawn(ctx context.Context, deferred ledger.DeferredSpawn) error {
+	return s.ProcessReservation(ctx, ledger.Result{Reserved: true, TriggerKey: deferred.TriggerKey, AOProjectID: deferred.AOProjectID}, deferred.Facts)
 }
 
 // ProcessReservation consumes the atomic intake reservation. A duplicate
@@ -77,6 +128,15 @@ func (s *Lifecycle) ProcessReservation(ctx context.Context, reservation ledger.R
 	expected, err := domain.NewCIFailureTriggerKey(facts.Repository, facts.PullNumber, facts.HeadSHA)
 	if err != nil || expected != reservation.TriggerKey {
 		return fmt.Errorf("reservation does not match check suite facts")
+	}
+	// Capacity is checked before the durable attempt so a held-back trigger
+	// keeps its reservation and no spawn attempt row is consumed.
+	available, err := s.HasCapacity(ctx)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return ErrAtCapacity
 	}
 	start, err := s.ledger.StartSpawnAttempt(ctx, reservation.TriggerKey, reservation.AOProjectID, s.now())
 	if err != nil || start.Blocked || !start.Started {
@@ -155,10 +215,10 @@ func (s *Lifecycle) FixWithAO(ctx context.Context, key domain.TriggerKey) error 
 	}
 	result, err := s.ao.SendApprovedFollowup(ctx, sessionID, fixPrompt(diagnosis))
 	if err != nil {
-		return s.ledger.CompleteSendAttempt(ctx, key, sessionID, "failed", err.Error(), s.now())
+		return s.recordFailedSend(ctx, key, sessionID, err.Error())
 	}
 	if result.StdoutTruncated || result.StderrTruncated {
-		return s.ledger.CompleteSendAttempt(ctx, key, sessionID, "failed", "AO follow-up output was truncated", s.now())
+		return s.recordFailedSend(ctx, key, sessionID, "AO follow-up output was truncated")
 	}
 	return s.ledger.CompleteSendAttempt(ctx, key, sessionID, "sent", "", s.now())
 }

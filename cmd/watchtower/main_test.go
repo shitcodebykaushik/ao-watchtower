@@ -14,6 +14,7 @@ import (
 	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/intake"
 	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/repopolicy"
 )
 
 func TestHelpDocumentsOneCommandPath(t *testing.T) {
@@ -23,6 +24,45 @@ func TestHelpDocumentsOneCommandPath(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "watchtower up") {
 		t.Fatalf("help=%q", output.String())
+	}
+}
+
+func TestVersionCommandReportsBuildIdentity(t *testing.T) {
+	var output bytes.Buffer
+	if err := runCLI(context.Background(), []string{"version"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), Version) {
+		t.Fatalf("version=%q", output.String())
+	}
+}
+
+func TestUnknownCommandIsRejected(t *testing.T) {
+	var output bytes.Buffer
+	if err := runCLI(context.Background(), []string{"teleport"}, &output); err == nil {
+		t.Fatal("expected an unknown command to be rejected")
+	}
+}
+
+func TestPolicyGateRefusesADeniedPath(t *testing.T) {
+	policy, err := repopolicy.Parse([]byte(`{"version":1,"autoFix":{"deniedPaths":[".github/**"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := policyGate{policy: policy, floor: 0.8}
+	denied := domain.Diagnosis{Category: "code", Confidence: 0.99, Summary: "workflow broken", Evidence: []domain.DiagnosisEvidence{{File: ".github/workflows/ci.yml", Check: "build"}}, RecommendedAction: "fix_code"}
+	if allowed, reason := gate.AllowAutoFix(denied); allowed || reason == "" {
+		t.Fatalf("allowed=%t reason=%q", allowed, reason)
+	}
+	permitted := domain.Diagnosis{Category: "code", Confidence: 0.99, Summary: "regression", Evidence: []domain.DiagnosisEvidence{{File: "internal/calculator.go", Check: "TestAdd"}}, RecommendedAction: "fix_code"}
+	if allowed, _ := gate.AllowAutoFix(permitted); !allowed {
+		t.Fatal("expected an allowed path to pass the gate")
+	}
+}
+
+func TestLimitLabelDescribesUnlimited(t *testing.T) {
+	if limitLabel(0) != "unlimited" || limitLabel(3) != "3" {
+		t.Fatalf("labels=%q/%q", limitLabel(0), limitLabel(3))
 	}
 }
 

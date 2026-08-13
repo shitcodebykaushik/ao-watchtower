@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -94,7 +95,10 @@ func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request)
 		return
 	}
 	if result.Reserved && h.processor != nil {
-		if err := h.processor.ProcessReservation(request.Context(), result, facts); err != nil {
+		// A deferred investigation is not an intake failure: the reservation is
+		// durable and will be replayed once capacity frees up. Reporting it as
+		// an error would make every poll cycle look broken.
+		if err := h.processor.ProcessReservation(request.Context(), result, facts); err != nil && !errors.Is(err, domain.ErrInvestigationDeferred) {
 			http.Error(response, "webhook accepted but processing failed", http.StatusInternalServerError)
 			return
 		}

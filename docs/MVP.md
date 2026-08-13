@@ -67,9 +67,45 @@ Allowed categories: `code`, `test`, `infrastructure`, `flaky`, `configuration`,
 - Spawn attempt and command outcome
 - Diagnosis payload and validation status
 - Human approval actor/time and subsequent send outcome
+- Repair verification: the dispatched head SHA, the head SHA later observed, the
+  terminal outcome, and when it settled
+- Retry authorization: actor, time, and the send attempt it supersedes
 
 Dashboard labels such as `investigating`, `awaiting_approval`, and `fixed` are
 derived from those facts rather than stored as an independent source of truth.
+
+## Repair verification
+
+A dispatched fix is not an outcome. `CompleteSendAttempt` opens a verification in
+the same transaction as a successful send, so a fix that reached AO is never left
+unwatched. The verification settles only when GitHub reports a completed check
+suite for a head commit **other** than the one that failed:
+
+- `verified_green` — CI completed successfully on the repair commit.
+- `still_failing` — CI still failed on the repair commit.
+- `abandoned` — the timeout expired first: the pull request left the open set, no
+  repair commit was pushed, or the conclusion never settled.
+
+Verification is driven by the observations the poller already collects, so it
+consumes no additional GitHub API budget. Resolution is one-way; a replayed
+observation cannot rewrite a settled outcome.
+
+## Repository policy
+
+A repository may commit `.watchtower.json` to constrain automatic repair with a
+confidence floor, path allow/deny globs, category filtering, an evidence-file
+requirement, and a blast-radius bound. A policy may only tighten the operator's
+flags. A malformed policy is a startup error rather than a silent fall back to
+permissive, and evidence paths are refused rather than normalized when they are
+absolute or contain traversal.
+
+## Limits
+
+- A concurrent-investigation limit is checked before the durable spawn attempt, so
+  a held-back trigger keeps its reservation. A scheduler replays reservations that
+  have no spawn attempt, which also recovers a process that stopped mid-flight.
+- A rolling 24-hour fix budget is checked immediately before each automatic
+  dispatch, so a burst of eligible diagnoses cannot overshoot it.
 
 ## Idempotency key
 
@@ -110,6 +146,18 @@ a shell.
 - A fix message cannot be sent without a durable human approval.
 - The global kill switch prevents new spawns and sends while leaving intake/audit
   visibility operational.
+- A successful send opens exactly one verification; a failed send opens none.
+- A settled verification is never rewritten by a later observation.
+- A dispatch that failed is reported to the caller as a failure, never as success,
+  and becomes retryable exactly once per explicit authorization.
+- A successful send can never be superseded by a retry authorization.
+- A trigger held back by the concurrency limit keeps its reservation and is
+  replayed, and intake reports it as accepted rather than failed.
+- A repository policy can tighten but never loosen the operator's confidence floor.
+- The unauthenticated dashboard shell carries no ledger content; `/api/state`
+  requires the admin token, and a diagnosis callback token does not unlock it.
+- Private installation state is unreadable by other accounts on Linux, macOS, and
+  Windows, and refuses to load when it is not.
 - `go test ./...` and `go vet ./...` pass without live external services.
 
 ## Explicit non-goals
@@ -119,5 +167,7 @@ a shell.
 - Direct LLM-provider integration
 - Direct AO database/API coupling
 - Supporting every GitHub event
-- GitLab, Gitea, Jira, or Linear in the hackathon MVP
+- GitLab, Gitea, Jira, or Linear
 - Hosted multi-tenant operation
+- Monitoring several repositories from one process
+- Automatic merging, even after a repair verifies green
