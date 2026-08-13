@@ -177,8 +177,8 @@ func Save(path string, state State) error {
 	if err := validateState(state); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
+	if err := protectDirectory(filepath.Dir(path)); err != nil {
+		return err
 	}
 	payload, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -196,8 +196,8 @@ func Save(path string, state State) error {
 			_ = os.Remove(temporaryPath)
 		}
 	}()
-	if err := temporary.Chmod(0600); err != nil {
-		return fmt.Errorf("protect state file: %w", err)
+	if err := protectFile(temporary); err != nil {
+		return err
 	}
 	if _, err := temporary.Write(payload); err != nil {
 		return fmt.Errorf("write state file: %w", err)
@@ -220,8 +220,8 @@ func Load(path string) (State, error) {
 	if err != nil {
 		return State{}, err
 	}
-	if info.Mode().Perm()&0077 != 0 {
-		return State{}, fmt.Errorf("state file %s must not be accessible by group or others", path)
+	if err := verifyPrivate(path, info); err != nil {
+		return State{}, err
 	}
 	payload, err := os.ReadFile(path)
 	if err != nil {

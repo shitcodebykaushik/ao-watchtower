@@ -10,9 +10,15 @@ permissions:
 
 jobs:
   test:
-    name: Go test and vet
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Watchtower stores local secrets and shells out to git, gh, and ao, so the
+    # per-platform code paths are only trustworthy if every platform is tested.
+    name: Go test and vet (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,4 +36,12 @@ jobs:
         run: go vet ./...
 
       - name: Check formatting
+        if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)"
+
+      - name: Cross-compile every supported platform
+        if: runner.os == 'Linux'
+        run: |
+          for target in linux/amd64 darwin/arm64 windows/amd64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./...
+          done
