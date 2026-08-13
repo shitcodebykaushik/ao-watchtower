@@ -153,6 +153,14 @@ func (s *Server) trigger(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		// The preconditions are checked before the authorization is committed.
+		// Spending the one-shot retry on a dispatch that cannot happen — the
+		// kill switch is on, the session is gone — would leave the trigger with
+		// no attempt sent and no authorization left.
+		if err := s.life.CheckDispatchable(r.Context(), key); err != nil {
+			http.Error(w, "retry unavailable", http.StatusConflict)
+			return
+		}
 		if err := s.ledger.AuthorizeSendRetry(r.Context(), key, actor, s.now()); err != nil {
 			http.Error(w, "retry unavailable", http.StatusConflict)
 			return

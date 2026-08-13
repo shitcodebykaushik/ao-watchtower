@@ -48,6 +48,19 @@ func Open(path string) (*Ledger, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
 	}
+	// `watchtower stats` opens the same file a running monitor is writing to.
+	// Without write-ahead logging and a busy timeout, either process can fail
+	// with "database is locked" — including the monitor, which would drop a
+	// durable audit fact because someone asked for a read-only report.
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable SQLite write-ahead logging: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set SQLite busy timeout: %w", err)
+	}
 	ledger := &Ledger{db: db}
 	if err := ledger.migrate(context.Background()); err != nil {
 		_ = db.Close()

@@ -36,17 +36,18 @@ type Options struct {
 }
 
 type Controller struct {
-	ledger     *ledger.Ledger
-	lifecycle  Lifecycle
-	actor      string
-	minimum    float64
-	interval   time.Duration
-	logger     *log.Logger
-	processing map[domain.TriggerKey]bool
-	budget     int
-	gate       Gate
-	now        func() time.Time
-	refused    map[domain.TriggerKey]bool
+	ledger       *ledger.Ledger
+	lifecycle    Lifecycle
+	actor        string
+	minimum      float64
+	interval     time.Duration
+	logger       *log.Logger
+	processing   map[domain.TriggerKey]bool
+	budget       int
+	gate         Gate
+	now          func() time.Time
+	refused      map[domain.TriggerKey]bool
+	budgetPaused bool
 }
 
 func New(durableLedger *ledger.Ledger, lifecycle Lifecycle, actor string, minimum float64, interval time.Duration, logger *log.Logger, options ...Options) (*Controller, error) {
@@ -130,8 +131,18 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 			return err
 		}
 		if !within {
-			c.logger.Printf("Auto-fix paused: daily budget of %d dispatched fixes is spent", c.budget)
+			// Log once per pause. A spent budget with an eligible diagnosis
+			// waiting is exactly the steady state the budget creates, and this
+			// loop runs every second.
+			if !c.budgetPaused {
+				c.budgetPaused = true
+				c.logger.Printf("Auto-fix paused: daily budget of %d dispatched fixes is spent", c.budget)
+			}
 			return nil
+		}
+		if c.budgetPaused {
+			c.budgetPaused = false
+			c.logger.Printf("Auto-fix resumed: daily budget of %d dispatched fixes has capacity again", c.budget)
 		}
 		c.processing[key] = true
 		if row.Approval == "" {

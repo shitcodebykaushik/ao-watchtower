@@ -192,11 +192,18 @@ func (l *Ledger) Stats(ctx context.Context) (Stats, error) {
 	return stats, err
 }
 
-// medianTimeToGreen measures from the moment the failing check suite was
+// medianTimeToGreen measures from the moment the failing check suite was first
 // recorded to the moment its repair verified green. The median resists the long
 // tail produced by a pull request left open overnight.
+//
+// A repository with two workflows produces two deliveries, and therefore two
+// evaluations, for one trigger. The earliest delivery is selected per trigger so
+// one repair contributes exactly one sample.
 func (l *Ledger) medianTimeToGreen(ctx context.Context) (time.Duration, error) {
-	rows, err := l.db.QueryContext(ctx, `SELECT w.received_at,v.resolved_at FROM fix_verifications v JOIN evaluations e ON e.trigger_key=v.trigger_key JOIN webhook_deliveries w ON w.delivery_id=e.delivery_id WHERE v.outcome=? AND v.resolved_at IS NOT NULL`, VerificationGreen)
+	rows, err := l.db.QueryContext(ctx, `SELECT
+(SELECT min(w.received_at) FROM evaluations e JOIN webhook_deliveries w ON w.delivery_id=e.delivery_id WHERE e.trigger_key=v.trigger_key) AS failed_at,
+v.resolved_at
+FROM fix_verifications v WHERE v.outcome=? AND v.resolved_at IS NOT NULL AND failed_at IS NOT NULL`, VerificationGreen)
 	if err != nil {
 		return 0, err
 	}

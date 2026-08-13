@@ -22,9 +22,23 @@ type DeferredSpawn struct {
 
 // ActiveInvestigations counts AO sessions Watchtower is still waiting on: a
 // spawn succeeded but no diagnosis has been recorded for that trigger yet.
-func (l *Ledger) ActiveInvestigations(ctx context.Context) (int, error) {
+//
+// staleAfter releases the slot held by a session that never answered. Without
+// it, an investigator that crashes before submitting a diagnosis would occupy a
+// concurrency slot forever, and once enough of them accumulate no further
+// investigation could ever start. The stalled attempt stays in the audit trail;
+// only its claim on capacity expires.
+func (l *Ledger) ActiveInvestigations(ctx context.Context, at time.Time, staleAfter time.Duration) (int, error) {
+	if at.IsZero() {
+		return 0, fmt.Errorf("current time is required")
+	}
+	if staleAfter <= 0 {
+		return 0, fmt.Errorf("stale threshold must be positive")
+	}
 	var active int
-	err := l.db.QueryRowContext(ctx, `SELECT count(*) FROM spawn_attempts s WHERE s.outcome='spawned' AND NOT EXISTS (SELECT 1 FROM diagnoses d WHERE d.trigger_key=s.trigger_key)`).Scan(&active)
+	err := l.db.QueryRowContext(ctx, `SELECT count(*) FROM spawn_attempts s
+WHERE s.outcome='spawned' AND s.completed_at IS NOT NULL AND s.completed_at > ?
+AND NOT EXISTS (SELECT 1 FROM diagnoses d WHERE d.trigger_key=s.trigger_key)`, timestamp(at.Add(-staleAfter))).Scan(&active)
 	return active, err
 }
 

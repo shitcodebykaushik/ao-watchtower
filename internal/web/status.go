@@ -116,8 +116,13 @@ func newRow(source ledger.DashboardRow, automationDisabled bool, at time.Time) R
 		}
 	}
 	row.Status = deriveStatus(source, row.Diagnosis != nil, automationDisabled, at)
-	row.CanApprove = row.TriggerKey != "" && row.Diagnosis != nil && source.Approval == "" && source.SendOutcome == ""
-	row.CanFix = row.TriggerKey != "" && row.Diagnosis != nil && source.SendOutcome == ""
+	// A send the kill switch blocked never reached AO, and StartSendAttempt
+	// deliberately ignores those rows when deciding whether a dispatch is
+	// already in flight. Treating it as "no send yet" is what keeps a card
+	// actionable after the operator re-enables automation.
+	dispatchAttempted := source.SendOutcome != "" && source.SendOutcome != "blocked_kill_switch"
+	row.CanApprove = row.TriggerKey != "" && row.Diagnosis != nil && source.Approval == "" && !dispatchAttempted
+	row.CanFix = row.TriggerKey != "" && row.Diagnosis != nil && !dispatchAttempted
 	row.CanRetry = row.TriggerKey != "" && source.SendOutcome == "failed"
 	return row
 }

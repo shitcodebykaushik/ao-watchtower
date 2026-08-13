@@ -1,11 +1,13 @@
 package automation
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,6 +176,54 @@ func TestDailyFixBudgetStopsDispatch(t *testing.T) {
 	}
 	if lifecycle.fixes != 1 {
 		t.Fatalf("expected one dispatch after the window rolled: fixes=%d", lifecycle.fixes)
+	}
+}
+
+// A spent budget with an eligible diagnosis waiting is the steady state the
+// budget creates, and RunOnce is driven once per second. Logging it every cycle
+// would produce tens of thousands of identical lines a day.
+func TestBudgetPauseIsLoggedOncePerPause(t *testing.T) {
+	durable, err := ledger.Open(filepath.Join(t.TempDir(), "watchtower.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	ctx := context.Background()
+	at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	spent := diagnosedTrigger(t, durable, 7, at)
+	if err := durable.RecordHumanApproval(ctx, spent, "operator", at); err != nil {
+		t.Fatal(err)
+	}
+	send, err := durable.StartSendAttempt(ctx, spent, "session-7", at)
+	if err != nil || !send.Started {
+		t.Fatalf("send=%#v err=%v", send, err)
+	}
+	if err := durable.CompleteSendAttempt(ctx, spent, "session-7", "sent", "", at); err != nil {
+		t.Fatal(err)
+	}
+	diagnosedTrigger(t, durable, 8, at.Add(time.Minute))
+
+	var logged bytes.Buffer
+	controller, err := New(durable, &fakeLifecycle{}, "auto-fix", DefaultMinimumConfidence, time.Second, log.New(&logged, "", 0), Options{DailyFixBudget: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.now = func() time.Time { return at.Add(time.Hour) }
+	for cycle := 0; cycle < 20; cycle++ {
+		if err := controller.RunOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pauses := strings.Count(logged.String(), "Auto-fix paused"); pauses != 1 {
+		t.Fatalf("budget pause logged %d times, want 1:\n%s", pauses, logged.String())
+	}
+	// Once the window rolls the pause clears and is announced exactly once.
+	controller.now = func() time.Time { return at.Add(25 * time.Hour) }
+	if err := controller.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if resumes := strings.Count(logged.String(), "Auto-fix resumed"); resumes != 1 {
+		t.Fatalf("budget resume logged %d times, want 1:\n%s", resumes, logged.String())
 	}
 }
 

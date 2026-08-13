@@ -429,3 +429,30 @@ type failingRunner struct{}
 func (failingRunner) Run(context.Context, string, ...string) ([]byte, error) {
 	return nil, fmt.Errorf("gh is not authenticated")
 }
+
+// The package documents that a hostile or broken gh invocation cannot exhaust
+// memory. That guarantee only holds if the bound is applied while the process
+// writes, not after it exits.
+func TestBoundedBufferCapsOutputAsItArrives(t *testing.T) {
+	buffer := &boundedBuffer{limit: 8}
+	written, err := buffer.Write([]byte("12345"))
+	if err != nil || written != 5 || buffer.truncated {
+		t.Fatalf("written=%d truncated=%t err=%v", written, buffer.truncated, err)
+	}
+	// A write that crosses the limit is accepted in full so the child process is
+	// never blocked or killed by a short write, but only the bound is retained.
+	written, err = buffer.Write([]byte("67890"))
+	if err != nil || written != 5 || !buffer.truncated {
+		t.Fatalf("written=%d truncated=%t err=%v", written, buffer.truncated, err)
+	}
+	if string(buffer.data) != "12345678" {
+		t.Fatalf("data=%q", buffer.data)
+	}
+	// Every later write is discarded rather than growing the buffer.
+	if _, err := buffer.Write(make([]byte, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if len(buffer.data) != 8 {
+		t.Fatalf("buffer grew past its limit: %d bytes", len(buffer.data))
+	}
+}

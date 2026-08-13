@@ -94,12 +94,17 @@ func NewLifecycle(durableLedger *ledger.Ledger, client AOClient, options ...Opti
 // trigger back. The reservation survives; the scheduler replays it later.
 var ErrAtCapacity = fmt.Errorf("investigation capacity reached: %w", domain.ErrInvestigationDeferred)
 
+// StaleInvestigation is how long a spawned investigator may go without
+// submitting a diagnosis before it stops counting against the concurrency
+// limit. An AO session that crashed must not hold a slot forever.
+const StaleInvestigation = 30 * time.Minute
+
 // HasCapacity reports whether another investigator may start now.
 func (s *Lifecycle) HasCapacity(ctx context.Context) (bool, error) {
 	if s.maxConcurrentInvestigations <= 0 {
 		return true, nil
 	}
-	active, err := s.ledger.ActiveInvestigations(ctx)
+	active, err := s.ledger.ActiveInvestigations(ctx, s.now(), StaleInvestigation)
 	if err != nil {
 		return false, err
 	}
@@ -176,6 +181,39 @@ func (s *Lifecycle) ApproveFix(ctx context.Context, key domain.TriggerKey, actor
 		return ErrNoValidDiagnosis
 	}
 	return s.ledger.RecordHumanApproval(ctx, key, actor, s.now())
+}
+
+// CheckDispatchable reports whether a fix could be dispatched right now,
+// without mutating anything. It exists so a caller can avoid spending a durable
+// one-shot retry authorization on a dispatch that is certain to fail. The
+// authoritative checks still live inside FixWithAO and StartSendAttempt; this
+// is a precondition, not a substitute.
+func (s *Lifecycle) CheckDispatchable(ctx context.Context, key domain.TriggerKey) error {
+	if _, valid, err := s.ledger.LatestValidDiagnosis(ctx, key); err != nil {
+		return err
+	} else if !valid {
+		return ErrNoValidDiagnosis
+	}
+	approved, err := s.ledger.HasHumanApproval(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !approved {
+		return ErrNoApproval
+	}
+	if _, spawned, err := s.ledger.SessionForTrigger(ctx, key); err != nil {
+		return err
+	} else if !spawned {
+		return ErrNoSession
+	}
+	disabled, err := s.ledger.AutomationDisabled(ctx)
+	if err != nil {
+		return err
+	}
+	if disabled {
+		return ErrAutomationDisabled
+	}
+	return nil
 }
 
 // FixWithAO sends only a fixed, diagnosis-derived instruction. It verifies the

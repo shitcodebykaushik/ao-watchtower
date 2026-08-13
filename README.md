@@ -422,7 +422,9 @@ Twenty failing pull requests should not become twenty coding-agent sessions.
 - `--max-investigations` (default 3) bounds concurrent AO investigators. A trigger
   held back keeps its durable reservation and is replayed automatically once
   capacity frees up — the same mechanism also recovers a reservation whose process
-  stopped before it reached AO.
+  stopped before it reached AO. An investigator that never submits a diagnosis
+  stops counting against the limit after 30 minutes, so a crashed session cannot
+  hold a slot forever; the stalled attempt stays in the audit trail.
 - `--daily-fix-budget` (default 20) bounds how many automatic fixes may be
   dispatched in a rolling 24 hours. It is checked immediately before each dispatch,
   so a burst of eligible diagnoses cannot overshoot it.

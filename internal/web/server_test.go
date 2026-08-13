@@ -252,6 +252,71 @@ func TestStalledInvestigationIsDerivedFromAge(t *testing.T) {
 	}
 }
 
+// A send the kill switch blocked never reached AO, and StartSendAttempt
+// deliberately ignores those rows. The card must stay actionable, otherwise
+// re-enabling automation leaves the trigger permanently stuck with no buttons.
+func TestKillSwitchBlockedSendKeepsTheRowActionable(t *testing.T) {
+	source := ledger.DashboardRow{
+		TriggerKey: "k", Repository: "o/r", Evaluation: policy.OutcomeReserved, SpawnOutcome: "spawned",
+		Diagnosis:   `{"category":"code","confidence":0.9,"summary":"broken","evidence":[{"file":"x.go"}],"recommendedAction":"fix_code"}`,
+		SendOutcome: "blocked_kill_switch",
+	}
+	row := newRow(source, false, time.Now())
+	if row.Status != StatusAutomationHeld {
+		t.Fatalf("status=%s", row.Status)
+	}
+	if !row.CanApprove || !row.CanFix {
+		t.Fatalf("a blocked send must leave the row actionable: %#v", row)
+	}
+	if row.CanRetry {
+		t.Fatal("a blocked send is not a failed dispatch and must not offer retry")
+	}
+	// A send that genuinely reached AO still closes the row to further dispatch.
+	source.SendOutcome = "sent"
+	if sent := newRow(source, false, time.Now()); sent.CanApprove || sent.CanFix {
+		t.Fatalf("a dispatched fix must not stay actionable: %#v", sent)
+	}
+}
+
+// The retry authorization is durable and single-use. Spending it on a dispatch
+// that cannot happen would leave the trigger with nothing sent and no
+// authorization left.
+func TestRetryDoesNotSpendTheAuthorizationWhenDispatchIsImpossible(t *testing.T) {
+	handler, life, durable, key := setupWith(t, fake{sendErr: context.DeadlineExceeded})
+	diagnosis := `{"category":"code","confidence":0.9,"summary":"broken","evidence":[{"file":"x.go"}],"recommendedAction":"fix_code"}`
+	if response := call(t, handler, http.MethodPost, "/api/triggers?action=diagnosis&trigger="+string(key), life.CallbackToken(key), diagnosis); response.Code != http.StatusOK {
+		t.Fatalf("diagnosis=%d", response.Code)
+	}
+	if response := call(t, handler, http.MethodPost, "/api/triggers?action=approve&trigger="+string(key), "admin", `{"actor":"me"}`); response.Code != http.StatusNoContent {
+		t.Fatalf("approve=%d", response.Code)
+	}
+	if response := call(t, handler, http.MethodPost, "/api/triggers?action=fix&trigger="+string(key), "admin", ""); response.Code != http.StatusConflict {
+		t.Fatalf("fix=%d", response.Code)
+	}
+	// Kill switch on: the retry must be refused before anything is committed.
+	if response := call(t, handler, http.MethodPost, "/api/automation", "admin", `{"disabled":true,"actor":"me"}`); response.Code != http.StatusNoContent {
+		t.Fatalf("automation=%d", response.Code)
+	}
+	if response := call(t, handler, http.MethodPost, "/api/triggers?action=retry&trigger="+string(key), "admin", `{"actor":"me"}`); response.Code != http.StatusConflict {
+		t.Fatalf("retry under kill switch=%d", response.Code)
+	}
+	if authorizations, err := durable.Count(context.Background(), "send_attempts"); err != nil || authorizations != 1 {
+		t.Fatalf("send attempts=%d err=%v", authorizations, err)
+	}
+	// With automation re-enabled the retry is still available: nothing was spent.
+	if response := call(t, handler, http.MethodPost, "/api/automation", "admin", `{"disabled":false,"actor":"me"}`); response.Code != http.StatusNoContent {
+		t.Fatalf("automation=%d", response.Code)
+	}
+	if response := call(t, handler, http.MethodPost, "/api/triggers?action=retry&trigger="+string(key), "admin", `{"actor":"me"}`); response.Code != http.StatusConflict {
+		// The fake AO still fails the send, so the dispatch reports a conflict,
+		// but the authorization must have been spent on a real attempt this time.
+		t.Logf("retry dispatch reported %d", response.Code)
+	}
+	if attempts, err := durable.Count(context.Background(), "send_attempts"); err != nil || attempts != 2 {
+		t.Fatalf("expected the retry to produce a second attempt: attempts=%d err=%v", attempts, err)
+	}
+}
+
 func TestUnparseableStoredDiagnosisIsNotPresentedAsValidated(t *testing.T) {
 	source := ledger.DashboardRow{TriggerKey: "k", Repository: "o/r", Evaluation: policy.OutcomeReserved, SpawnOutcome: "spawned", Diagnosis: `{"category":"nonsense"}`}
 	row := newRow(source, false, time.Now())

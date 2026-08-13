@@ -136,6 +136,120 @@ func TestResolveVerificationIsTerminalAndSurvivesReopen(t *testing.T) {
 	}
 }
 
+// An investigator that crashes before submitting a diagnosis must not hold a
+// concurrency slot forever, or enough of them would block every future
+// investigation permanently.
+func TestStalledInvestigationsStopConsumingCapacity(t *testing.T) {
+	l := newLedger(t)
+	ctx := context.Background()
+	at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	key := reserveTrigger(t, l, at)
+	start, err := l.StartSpawnAttempt(ctx, key, "project", at)
+	if err != nil || !start.Started {
+		t.Fatalf("start=%#v err=%v", start, err)
+	}
+	if err := l.CompleteSpawnAttempt(ctx, key, "spawned", "session-1", "", at); err != nil {
+		t.Fatal(err)
+	}
+	active, err := l.ActiveInvestigations(ctx, at.Add(time.Minute), 30*time.Minute)
+	if err != nil || active != 1 {
+		t.Fatalf("active=%d err=%v", active, err)
+	}
+	active, err = l.ActiveInvestigations(ctx, at.Add(31*time.Minute), 30*time.Minute)
+	if err != nil || active != 0 {
+		t.Fatalf("stale investigation still counted: active=%d err=%v", active, err)
+	}
+	// A diagnosis releases the slot regardless of age.
+	diagnosis := domain.Diagnosis{Category: "code", Confidence: 0.9, Summary: "found it", Evidence: []domain.DiagnosisEvidence{{Check: "TestAdd"}}, RecommendedAction: "fix_code"}
+	if err := l.RecordDiagnosis(ctx, key, []byte(`{}`), &diagnosis, true, at); err != nil {
+		t.Fatal(err)
+	}
+	active, err = l.ActiveInvestigations(ctx, at.Add(time.Minute), 30*time.Minute)
+	if err != nil || active != 0 {
+		t.Fatalf("active=%d err=%v", active, err)
+	}
+	if _, err := l.ActiveInvestigations(ctx, time.Time{}, time.Minute); err == nil {
+		t.Fatal("expected a zero time to be rejected")
+	}
+	if _, err := l.ActiveInvestigations(ctx, at, 0); err == nil {
+		t.Fatal("expected a non-positive stale threshold to be rejected")
+	}
+}
+
+// A repository with two workflows produces two deliveries for one trigger. That
+// is one repair and must contribute one sample to the median, not two.
+func TestMedianTimeToGreenCountsEachRepairOnce(t *testing.T) {
+	l := newLedger(t)
+	ctx := context.Background()
+	at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	facts, evaluation := testFacts(t), testEval(t)
+	for index, delivery := range []struct {
+		id       string
+		digest   string
+		received time.Time
+	}{
+		{"delivery-build", "digest-build", at},
+		{"delivery-lint", "digest-lint", at.Add(2 * time.Minute)},
+	} {
+		suiteFacts := facts
+		suiteFacts.ProviderID = int64(index + 1)
+		result, err := l.RecordEvaluation(ctx, domain.WebhookDelivery{ID: delivery.id, PayloadDigest: delivery.digest, ReceivedAt: delivery.received}, suiteFacts, evaluation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.TriggerKey != evaluation.TriggerKey {
+			t.Fatalf("expected both deliveries to share one trigger, got %s", result.TriggerKey)
+		}
+	}
+	key := evaluation.TriggerKey
+	dispatchFix(t, l, key, at)
+	if err := l.CompleteSendAttempt(ctx, key, "session-1", "sent", "", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ResolveVerification(ctx, key, "0123456789abcdef", VerificationGreen, "CI passed", at.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := l.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Measured from the earliest delivery for the trigger, counted once. Two
+	// samples would average to 9m instead.
+	if stats.MedianTimeToGreen != 10*time.Minute {
+		t.Fatalf("medianTimeToGreen=%s want 10m0s", stats.MedianTimeToGreen)
+	}
+	if stats.VerifiedGreen != 1 {
+		t.Fatalf("verifiedGreen=%d", stats.VerifiedGreen)
+	}
+}
+
+// `watchtower stats` opens the same file a running monitor is writing to.
+func TestConcurrentReaderDoesNotBlockWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	ctx := context.Background()
+	at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	key := reserveTrigger(t, writer, at)
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatalf("a second reader must be able to open the ledger: %v", err)
+	}
+	defer reader.Close()
+	if _, err := reader.Stats(ctx); err != nil {
+		t.Fatalf("concurrent read failed: %v", err)
+	}
+	if err := writer.RecordHumanApproval(ctx, key, "operator", at); err != nil {
+		t.Fatalf("concurrent write failed: %v", err)
+	}
+	if _, err := reader.Stats(ctx); err != nil {
+		t.Fatalf("read after a concurrent write failed: %v", err)
+	}
+}
+
 func TestSendRetryRequiresAFailedDispatch(t *testing.T) {
 	l := newLedger(t)
 	ctx := context.Background()

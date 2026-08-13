@@ -26,7 +26,6 @@
 package prcomment
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -66,23 +65,45 @@ type Runner interface {
 type ExecRunner struct{}
 
 // Run executes the named executable with the given arguments and returns its
-// standard output.
+// standard output. The bound is applied while the process writes rather than
+// afterwards, so an unbounded response never reaches memory in the first place.
 func (ExecRunner) Run(ctx context.Context, executable string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, executable, args...)
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
+	stdout := &boundedBuffer{limit: outputLimit}
+	stderr := &boundedBuffer{limit: stderrLimit}
+	command.Stdout = stdout
+	command.Stderr = stderr
 	if err := command.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if len(message) > stderrLimit {
-			message = message[:stderrLimit]
-		}
-		return nil, fmt.Errorf("run %s: %s", executable, message)
+		return nil, fmt.Errorf("run %s: %s", executable, strings.TrimSpace(string(stderr.data)))
 	}
-	if stdout.Len() > outputLimit {
+	if stdout.truncated {
 		return nil, fmt.Errorf("run %s: output exceeds limit", executable)
 	}
-	return stdout.Bytes(), nil
+	return stdout.data, nil
+}
+
+// boundedBuffer accumulates at most limit bytes and records that it dropped the
+// rest. Writes always report full acceptance so the child process is never
+// blocked or killed by a short write.
+type boundedBuffer struct {
+	data      []byte
+	limit     int
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(data []byte) (int, error) {
+	remaining := b.limit - len(b.data)
+	if remaining <= 0 {
+		b.truncated = true
+		return len(data), nil
+	}
+	if len(data) > remaining {
+		b.data = append(b.data, data[:remaining]...)
+		b.truncated = true
+		return len(data), nil
+	}
+	b.data = append(b.data, data...)
+	return len(data), nil
 }
 
 // Publisher writes Watchtower comments onto pull requests through the gh CLI.

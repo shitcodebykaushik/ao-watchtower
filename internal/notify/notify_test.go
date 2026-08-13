@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"sync"
 	"testing"
 	"time"
 
@@ -145,6 +146,105 @@ func TestFailuresAreReported(t *testing.T) {
 	if err := controller.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected a store failure to be reported")
 	}
+}
+
+func greenResult(t *testing.T) verification.Result {
+	t.Helper()
+	repository, err := domain.ParseRepository("acme/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verification.Result{
+		TriggerKey: domain.TriggerKey(diagnosedRow().TriggerKey), Repository: repository, PullNumber: 7,
+		ObservedHeadSHA: "0123456789abcdef", Outcome: ledger.VerificationGreen, Detail: "CI passed",
+	}
+}
+
+// A transient gh failure must not lose the outcome comment. The verification is
+// already settled durably and the recorder never revisits it, so the controller
+// itself has to carry the retry.
+func TestOutcomeIsRetriedAfterATransientFailure(t *testing.T) {
+	store := &fakeStore{dashboard: ledger.Dashboard{}}
+	publisher := &fakePublisher{failWith: errors.New("gh unavailable")}
+	controller := newController(t, store, publisher)
+	result := greenResult(t)
+	if err := controller.VerificationSettled(context.Background(), result); err == nil {
+		t.Fatal("expected the publish failure to be reported")
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatalf("calls=%#v", publisher.calls)
+	}
+	// Still failing: the result must stay queued rather than being dropped.
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected the retry to report the continuing failure")
+	}
+	publisher.failWith = nil
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected exactly one published outcome, got %d", len(publisher.calls))
+	}
+	// Once published it must not be published again.
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("calls=%d", len(publisher.calls))
+	}
+}
+
+func TestQueuedOutcomesDoNotAccumulateDuplicates(t *testing.T) {
+	store := &fakeStore{dashboard: ledger.Dashboard{}}
+	publisher := &fakePublisher{failWith: errors.New("gh unavailable")}
+	controller := newController(t, store, publisher)
+	result := greenResult(t)
+	for attempt := 0; attempt < 5; attempt++ {
+		if err := controller.VerificationSettled(context.Background(), result); err == nil {
+			t.Fatal("expected the publish failure to be reported")
+		}
+	}
+	controller.mutex.Lock()
+	queued := len(controller.pending)
+	controller.mutex.Unlock()
+	if queued != 1 {
+		t.Fatalf("queued=%d want 1", queued)
+	}
+}
+
+// The controller is reached from its own ticker and from the poller goroutine
+// that settles verifications. Both touch the published set. Run under -race.
+func TestConcurrentPublishingIsSafe(t *testing.T) {
+	store := &fakeStore{dashboard: ledger.Dashboard{Rows: []ledger.DashboardRow{diagnosedRow()}}}
+	publisher := &lockedPublisher{}
+	controller := newController(t, store, publisher)
+	result := greenResult(t)
+	var group sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for attempt := 0; attempt < 25; attempt++ {
+				_ = controller.RunOnce(context.Background())
+				_ = controller.VerificationSettled(context.Background(), result)
+			}
+		}()
+	}
+	group.Wait()
+}
+
+// lockedPublisher is safe to call concurrently, so the test exercises the
+// controller's synchronization rather than the fake's.
+type lockedPublisher struct {
+	mutex sync.Mutex
+	calls int
+}
+
+func (p *lockedPublisher) Upsert(context.Context, domain.Repository, int64, prcomment.Body) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.calls++
+	return nil
 }
 
 func TestNewValidatesInput(t *testing.T) {
