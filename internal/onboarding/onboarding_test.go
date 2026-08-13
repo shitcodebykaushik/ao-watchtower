@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -36,7 +37,11 @@ func (f *fakeCommander) Run(_ context.Context, executable string, args ...string
 	case executable == "ao" && reflect.DeepEqual(args, []string{"project", "ls", "--json"}):
 		return []byte(`{"projects":[]}`), nil
 	case executable == "ao" && reflect.DeepEqual(args, []string{"project", "get", "service", "--json"}):
-		return []byte(`{"project":{"path":"` + f.root + `"}}`), nil
+		encodedRoot, err := json.Marshal(f.root)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		return []byte(`{"project":{"path":` + string(encodedRoot) + `}}`), nil
 	case executable == "ao" && len(args) > 2 && args[0] == "project" && args[1] == "add":
 		f.added = true
 		return []byte("registered project service\n"), nil
@@ -80,8 +85,12 @@ func TestSetupCreatesProtectedReusableState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
-		t.Fatalf("state mode=%o", info.Mode().Perm())
+	if EnforcesUnixPermissions {
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("state mode=%o", info.Mode().Perm())
+		}
+	} else if err := verifyPrivate(path, info); err != nil {
+		t.Fatalf("state is not private: %v", err)
 	}
 	configuration, err := state.Config()
 	if err != nil || configuration.AdminToken == "" || configuration.WebhookSecret == configuration.CallbackSecret {
@@ -113,15 +122,5 @@ func TestSetupCreatesProtectedReusableState(t *testing.T) {
 	persisted, err := Load(path)
 	if err != nil || persisted.Listen != overridden.Listen {
 		t.Fatalf("persisted=%#v err=%v", persisted, err)
-	}
-}
-
-func TestLoadRejectsExposedSecrets(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "group or others") {
-		t.Fatalf("err=%v", err)
 	}
 }

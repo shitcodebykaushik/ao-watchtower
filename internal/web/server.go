@@ -5,14 +5,14 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
-	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
-	"github.com/shitcodebykaushik/ao-watchtower/internal/service"
-	"html/template"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/shitcodebykaushik/ao-watchtower/internal/domain"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/ledger"
+	"github.com/shitcodebykaushik/ao-watchtower/internal/service"
 )
 
 type Server struct {
@@ -20,49 +20,77 @@ type Server struct {
 	life   *service.Lifecycle
 	admin  []byte
 	demo   bool
-	tmpl   *template.Template
+	now    func() time.Time
 }
 
 func New(l *ledger.Ledger, life *service.Lifecycle, adminToken string, demo bool) (*Server, error) {
 	if l == nil || life == nil || adminToken == "" {
 		return nil, fmt.Errorf("ledger, lifecycle, and admin token are required")
 	}
-	t, e := template.New("dashboard").Parse(page)
-	if e != nil {
-		return nil, e
-	}
-	return &Server{l, life, []byte(adminToken), demo, t}, nil
+	return &Server{ledger: l, life: life, admin: []byte(adminToken), demo: demo, now: time.Now}, nil
 }
+
 func (s *Server) Handler() http.Handler {
-	m := http.NewServeMux()
-	m.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			w.WriteHeader(405)
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 	})
-	m.HandleFunc("/", s.dashboard)
-	m.HandleFunc("/api/triggers", s.trigger)
-	m.HandleFunc("/api/automation", s.automation)
-	return m
+	mux.HandleFunc("/", s.dashboard)
+	mux.HandleFunc("/api/state", s.state)
+	mux.HandleFunc("/api/triggers", s.trigger)
+	mux.HandleFunc("/api/automation", s.automation)
+	return mux
 }
-func now() time.Time { return time.Now() }
+
+// dashboard serves the static application shell only. Ledger contents, which
+// include agent prose and repository paths, are served exclusively by /api/state
+// behind the admin token rather than to anything that can reach the port.
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" || r.Method != http.MethodGet {
 		http.NotFound(w, r)
 		return
 	}
-	d, e := s.ledger.Dashboard(r.Context())
-	if e != nil {
-		http.Error(w, "dashboard unavailable", 500)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	page := shell
+	if s.demo {
+		page = strings.Replace(page, "data-demo=\"false\"", "data-demo=\"true\"", 1)
+	}
+	_, _ = io.WriteString(w, page)
+}
+
+func (s *Server) state(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	_ = s.tmpl.Execute(w, struct {
-		ledger.Dashboard
-		Demo bool
-	}{d, s.demo})
+	if !s.adminAuth(w, r) {
+		return
+	}
+	dashboard, err := s.ledger.Dashboard(r.Context())
+	if err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
+		return
+	}
+	stats, err := s.ledger.Stats(r.Context())
+	if err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
+		return
+	}
+	at := s.now()
+	payload := State{Demo: s.demo, AutomationDisabled: dashboard.AutomationDisabled, Stats: newStatsPayload(stats), Rows: make([]Row, 0, len(dashboard.Rows))}
+	for _, source := range dashboard.Rows {
+		payload.Rows = append(payload.Rows, newRow(source, dashboard.AutomationDisabled, at))
+	}
+	writeJSON(w, payload)
 }
+
 func (s *Server) trigger(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/api/triggers" {
 		http.NotFound(w, r)
@@ -70,26 +98,26 @@ func (s *Server) trigger(w http.ResponseWriter, r *http.Request) {
 	}
 	key := domain.TriggerKey(r.URL.Query().Get("trigger"))
 	if key == "" {
-		http.Error(w, "invalid trigger", 400)
+		http.Error(w, "invalid trigger", http.StatusBadRequest)
 		return
 	}
 	switch r.URL.Query().Get("action") {
 	case "diagnosis":
 		if r.Method != http.MethodPost {
-			w.WriteHeader(405)
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		if !s.callbackAuth(r, key) {
-			http.Error(w, "unauthorized", 401)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		raw, e := readBody(w, r, 64<<10)
-		if e != nil {
+		raw, err := readBody(w, r, ledger.MaxDiagnosisRaw)
+		if err != nil {
 			return
 		}
-		valid, e := s.life.SubmitDiagnosis(r.Context(), key, raw)
-		if e != nil {
-			http.Error(w, "unable to record diagnosis", 500)
+		valid, err := s.life.SubmitDiagnosis(r.Context(), key, raw)
+		if err != nil {
+			http.Error(w, "unable to record diagnosis", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, map[string]bool{"valid": valid})
@@ -97,87 +125,133 @@ func (s *Server) trigger(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !s.adminAuth(w, r) {
 			return
 		}
-		var v struct {
-			Actor string `json:"actor"`
-		}
-		if !decodeBody(w, r, &v) {
+		actor, ok := decodeActor(w, r)
+		if !ok {
 			return
 		}
-		if len(v.Actor) > 128 || strings.TrimSpace(v.Actor) == "" {
-			http.Error(w, "invalid actor", 400)
+		if err := s.life.ApproveFix(r.Context(), key, actor); err != nil {
+			http.Error(w, "approval unavailable", http.StatusConflict)
 			return
 		}
-		if e := s.life.ApproveFix(r.Context(), key, v.Actor); e != nil {
-			http.Error(w, "approval unavailable", 409)
-			return
-		}
-		w.WriteHeader(204)
+		w.WriteHeader(http.StatusNoContent)
 	case "fix":
 		if r.Method != http.MethodPost || !s.adminAuth(w, r) {
 			return
 		}
-		if e := s.life.FixWithAO(r.Context(), key); e != nil {
-			http.Error(w, "fix unavailable", 409)
+		if err := s.life.FixWithAO(r.Context(), key); err != nil {
+			http.Error(w, "fix unavailable", http.StatusConflict)
 			return
 		}
-		w.WriteHeader(202)
+		w.WriteHeader(http.StatusAccepted)
+	case "retry":
+		// Retry authorizes exactly one further dispatch, and only for a send
+		// that failed. It keeps the original attempt in the audit trail.
+		if r.Method != http.MethodPost || !s.adminAuth(w, r) {
+			return
+		}
+		actor, ok := decodeActor(w, r)
+		if !ok {
+			return
+		}
+		// The preconditions are checked before the authorization is committed.
+		// Spending the one-shot retry on a dispatch that cannot happen — the
+		// kill switch is on, the session is gone — would leave the trigger with
+		// no attempt sent and no authorization left.
+		if err := s.life.CheckDispatchable(r.Context(), key); err != nil {
+			http.Error(w, "retry unavailable", http.StatusConflict)
+			return
+		}
+		if err := s.ledger.AuthorizeSendRetry(r.Context(), key, actor, s.now()); err != nil {
+			http.Error(w, "retry unavailable", http.StatusConflict)
+			return
+		}
+		if err := s.life.FixWithAO(r.Context(), key); err != nil {
+			http.Error(w, "fix unavailable", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
 	default:
 		http.NotFound(w, r)
 	}
 }
+
 func (s *Server) automation(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || !s.adminAuth(w, r) {
 		return
 	}
-	var v struct {
+	var body struct {
 		Disabled bool   `json:"disabled"`
 		Actor    string `json:"actor"`
 	}
-	if !decodeBody(w, r, &v) {
+	if !decodeBody(w, r, &body) {
 		return
 	}
-	if len(v.Actor) > 128 || strings.TrimSpace(v.Actor) == "" {
-		http.Error(w, "invalid actor", 400)
+	if !validActor(body.Actor) {
+		http.Error(w, "invalid actor", http.StatusBadRequest)
 		return
 	}
-	if e := s.ledger.SetAutomationDisabled(r.Context(), v.Disabled, v.Actor, now()); e != nil {
-		http.Error(w, "unable to update automation", 500)
+	if err := s.ledger.SetAutomationDisabled(r.Context(), body.Disabled, body.Actor, s.now()); err != nil {
+		http.Error(w, "unable to update automation", http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(204)
+	w.WriteHeader(http.StatusNoContent)
 }
+
 func (s *Server) adminAuth(w http.ResponseWriter, r *http.Request) bool {
-	v := r.Header.Get("Authorization")
-	const p = "Bearer "
-	if !strings.HasPrefix(v, p) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(v, p)), s.admin) != 1 {
-		http.Error(w, "unauthorized", 401)
+	value := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(value, prefix) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(value, prefix)), s.admin) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
 	return true
 }
+
 func (s *Server) callbackAuth(r *http.Request, key domain.TriggerKey) bool {
-	v := r.Header.Get("Authorization")
-	return strings.HasPrefix(v, "Bearer ") && s.life.VerifyCallbackToken(key, strings.TrimPrefix(v, "Bearer "))
+	value := r.Header.Get("Authorization")
+	return strings.HasPrefix(value, "Bearer ") && s.life.VerifyCallbackToken(key, strings.TrimPrefix(value, "Bearer "))
 }
-func readBody(w http.ResponseWriter, r *http.Request, n int64) ([]byte, error) {
-	b, e := io.ReadAll(http.MaxBytesReader(w, r.Body, n))
-	if e != nil {
-		http.Error(w, "invalid request", 400)
+
+func decodeActor(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var body struct {
+		Actor string `json:"actor"`
 	}
-	return b, e
+	if !decodeBody(w, r, &body) {
+		return "", false
+	}
+	if !validActor(body.Actor) {
+		http.Error(w, "invalid actor", http.StatusBadRequest)
+		return "", false
+	}
+	return body.Actor, true
 }
-func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	b, e := readBody(w, r, 4096)
-	if e != nil {
+
+func validActor(actor string) bool {
+	return len(actor) <= 128 && strings.TrimSpace(actor) != ""
+}
+
+func readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+	}
+	return body, err
+}
+
+func decodeBody(w http.ResponseWriter, r *http.Request, target any) bool {
+	body, err := readBody(w, r, 4096)
+	if err != nil {
 		return false
 	}
-	if json.Unmarshal(b, v) != nil {
-		http.Error(w, "invalid JSON", 400)
+	if json.Unmarshal(body, target) != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return false
 	}
 	return true
 }
-func writeJSON(w http.ResponseWriter, v any) {
+
+func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_ = json.NewEncoder(w).Encode(value)
 }

@@ -48,6 +48,19 @@ func Open(path string) (*Ledger, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
 	}
+	// `watchtower stats` opens the same file a running monitor is writing to.
+	// Without write-ahead logging and a busy timeout, either process can fail
+	// with "database is locked" — including the monitor, which would drop a
+	// durable audit fact because someone asked for a read-only report.
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable SQLite write-ahead logging: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set SQLite busy timeout: %w", err)
+	}
 	ledger := &Ledger{db: db}
 	if err := ledger.migrate(context.Background()); err != nil {
 		_ = db.Close()
@@ -97,7 +110,15 @@ CREATE TABLE IF NOT EXISTS human_approvals (
 CREATE INDEX IF NOT EXISTS approvals_by_trigger ON human_approvals(trigger_key, id DESC);
 CREATE TABLE IF NOT EXISTS send_attempts (
  id INTEGER PRIMARY KEY AUTOINCREMENT, trigger_key TEXT NOT NULL REFERENCES triggers(trigger_key), ao_session_id TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, outcome TEXT NOT NULL, detail TEXT NOT NULL
-);`)
+);
+CREATE TABLE IF NOT EXISTS fix_verifications (
+ trigger_key TEXT PRIMARY KEY REFERENCES triggers(trigger_key), owner TEXT NOT NULL, repo TEXT NOT NULL, pull_number INTEGER NOT NULL, dispatched_head_sha TEXT NOT NULL, observed_head_sha TEXT, outcome TEXT NOT NULL, started_at TEXT NOT NULL, resolved_at TEXT, detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS verifications_by_outcome ON fix_verifications(outcome);
+CREATE TABLE IF NOT EXISTS send_retries (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, trigger_key TEXT NOT NULL REFERENCES triggers(trigger_key), actor TEXT NOT NULL, authorized_at TEXT NOT NULL, superseded_attempt_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS retries_by_trigger ON send_retries(trigger_key, id DESC);`)
 	if err != nil {
 		return fmt.Errorf("migrate SQLite ledger: %w", err)
 	}
@@ -369,8 +390,12 @@ func (l *Ledger) StartSendAttempt(ctx context.Context, key domain.TriggerKey, se
 		return SendStart{}, err
 	}
 	defer tx.Rollback()
+	// A send attempt after the most recent retry authorization blocks another
+	// one. Attempts recorded before that authorization are deliberately
+	// superseded so an operator can retry a failed dispatch without losing the
+	// original audit row.
 	var existing string
-	err = tx.QueryRowContext(ctx, `SELECT outcome FROM send_attempts WHERE trigger_key=? AND outcome<>'blocked_kill_switch' ORDER BY id DESC LIMIT 1`, key).Scan(&existing)
+	err = tx.QueryRowContext(ctx, `SELECT outcome FROM send_attempts WHERE trigger_key=? AND outcome<>'blocked_kill_switch' AND id > COALESCE((SELECT superseded_attempt_id FROM send_retries WHERE trigger_key=? ORDER BY id DESC LIMIT 1),0) ORDER BY id DESC LIMIT 1`, key, key).Scan(&existing)
 	if err == nil {
 		if err = tx.Commit(); err != nil {
 			return SendStart{}, err
@@ -400,11 +425,21 @@ func (l *Ledger) StartSendAttempt(ctx context.Context, key domain.TriggerKey, se
 	}
 	return SendStart{Started: !disabled, Blocked: disabled}, nil
 }
+
+// CompleteSendAttempt closes the in-progress dispatch and, when the fix
+// actually reached AO, opens the verification that will later record whether CI
+// went green. Both facts commit together so a dispatched fix is never left
+// unwatched.
 func (l *Ledger) CompleteSendAttempt(ctx context.Context, key domain.TriggerKey, sessionID, outcome, detail string, at time.Time) error {
 	if key == "" || sessionID == "" || at.IsZero() || !oneOf(outcome, "sent", "failed") {
 		return fmt.Errorf("invalid send completion")
 	}
-	result, err := l.db.ExecContext(ctx, `UPDATE send_attempts SET completed_at=?,outcome=?,detail=? WHERE id=(SELECT id FROM send_attempts WHERE trigger_key=? AND ao_session_id=? AND outcome='started' ORDER BY id DESC LIMIT 1)`, timestamp(at), outcome, boundedDetail(detail), key, sessionID)
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE send_attempts SET completed_at=?,outcome=?,detail=? WHERE id=(SELECT id FROM send_attempts WHERE trigger_key=? AND ao_session_id=? AND outcome='started' ORDER BY id DESC LIMIT 1)`, timestamp(at), outcome, boundedDetail(detail), key, sessionID)
 	if err != nil {
 		return err
 	}
@@ -415,7 +450,12 @@ func (l *Ledger) CompleteSendAttempt(ctx context.Context, key domain.TriggerKey,
 	if rows != 1 {
 		return fmt.Errorf("send attempt is not in progress")
 	}
-	return nil
+	if outcome == "sent" {
+		if err := openVerificationTx(ctx, tx, key, at); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func automationDisabledTx(ctx context.Context, tx *sql.Tx) (bool, error) {
@@ -481,8 +521,16 @@ func (l *Ledger) Count(ctx context.Context, table string) (int, error) {
 // DashboardRow is a read model assembled solely from durable ledger facts.
 type DashboardRow struct {
 	TriggerKey, Repository, HeadSHA, Evaluation, ProjectID, SessionID, SpawnOutcome, Diagnosis, Approval, SendOutcome string
-	PullNumber                                                                                                        int64
-	CreatedAt                                                                                                         time.Time
+	// Conclusion is the reported check-suite result, DetailsURL links to the
+	// provider run, and Verification carries the post-repair CI outcome. They
+	// let the dashboard answer "why did this fail" and "did the fix work"
+	// without leaving the page.
+	Conclusion, DetailsURL, Verification, SendDetail string
+	PullNumber                                       int64
+	CreatedAt                                        time.Time
+	// SpawnCompletedAt is zero until AO answered the spawn. Staleness is derived
+	// from it at read time rather than stored as its own source of truth.
+	SpawnCompletedAt time.Time
 }
 type Dashboard struct {
 	AutomationDisabled                                bool
@@ -504,7 +552,13 @@ func (l *Ledger) Dashboard(ctx context.Context) (Dashboard, error) {
 			return d, err
 		}
 	}
-	rows, err := l.db.QueryContext(ctx, `SELECT COALESCE(e.trigger_key,''), f.owner||'/'||f.repo,f.pull_number,f.head_sha,e.outcome,COALESCE(e.ao_project_id,''),COALESCE(s.ao_session_id,''),COALESCE(s.outcome,''),COALESCE((SELECT structured_json FROM diagnoses d WHERE d.trigger_key=e.trigger_key AND d.valid=1 ORDER BY d.id DESC LIMIT 1),''),COALESCE((SELECT actor FROM human_approvals a WHERE a.trigger_key=e.trigger_key ORDER BY a.id DESC LIMIT 1),''),COALESCE((SELECT outcome FROM send_attempts z WHERE z.trigger_key=e.trigger_key ORDER BY z.id DESC LIMIT 1),''),w.received_at FROM evaluations e JOIN check_suite_facts f ON f.delivery_id=e.delivery_id JOIN webhook_deliveries w ON w.delivery_id=e.delivery_id LEFT JOIN spawn_attempts s ON s.trigger_key=e.trigger_key ORDER BY w.received_at DESC LIMIT 100`)
+	rows, err := l.db.QueryContext(ctx, `SELECT COALESCE(e.trigger_key,''),f.owner||'/'||f.repo,f.pull_number,f.head_sha,f.conclusion,f.details_url,e.outcome,COALESCE(e.ao_project_id,''),COALESCE(s.ao_session_id,''),COALESCE(s.outcome,''),s.completed_at,
+COALESCE((SELECT structured_json FROM diagnoses d WHERE d.trigger_key=e.trigger_key AND d.valid=1 ORDER BY d.id DESC LIMIT 1),''),
+COALESCE((SELECT actor FROM human_approvals a WHERE a.trigger_key=e.trigger_key ORDER BY a.id DESC LIMIT 1),''),
+COALESCE((SELECT outcome FROM send_attempts z WHERE z.trigger_key=e.trigger_key ORDER BY z.id DESC LIMIT 1),''),
+COALESCE((SELECT detail FROM send_attempts z WHERE z.trigger_key=e.trigger_key ORDER BY z.id DESC LIMIT 1),''),
+COALESCE((SELECT outcome FROM fix_verifications v WHERE v.trigger_key=e.trigger_key),''),
+w.received_at FROM evaluations e JOIN check_suite_facts f ON f.delivery_id=e.delivery_id JOIN webhook_deliveries w ON w.delivery_id=e.delivery_id LEFT JOIN spawn_attempts s ON s.trigger_key=e.trigger_key ORDER BY w.received_at DESC LIMIT 100`)
 	if err != nil {
 		return d, err
 	}
@@ -512,12 +566,19 @@ func (l *Ledger) Dashboard(ctx context.Context) (Dashboard, error) {
 	for rows.Next() {
 		var r DashboardRow
 		var created string
-		if err = rows.Scan(&r.TriggerKey, &r.Repository, &r.PullNumber, &r.HeadSHA, &r.Evaluation, &r.ProjectID, &r.SessionID, &r.SpawnOutcome, &r.Diagnosis, &r.Approval, &r.SendOutcome, &created); err != nil {
+		var spawnCompleted sql.NullString
+		if err = rows.Scan(&r.TriggerKey, &r.Repository, &r.PullNumber, &r.HeadSHA, &r.Conclusion, &r.DetailsURL, &r.Evaluation, &r.ProjectID, &r.SessionID, &r.SpawnOutcome, &spawnCompleted, &r.Diagnosis, &r.Approval, &r.SendOutcome, &r.SendDetail, &r.Verification, &created); err != nil {
 			return d, err
 		}
 		r.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
 		if err != nil {
 			return d, err
+		}
+		if spawnCompleted.Valid {
+			r.SpawnCompletedAt, err = time.Parse(time.RFC3339Nano, spawnCompleted.String)
+			if err != nil {
+				return d, err
+			}
 		}
 		d.Rows = append(d.Rows, r)
 	}

@@ -17,14 +17,16 @@ Human review mode ── or ── explicit auto-fix policy
         ↓
 AO tests, commits, and non-force pushes the scoped fix
         ↓
-GitHub reruns CI; Watchtower records the result
+GitHub reruns CI; Watchtower watches the repair commit
+        ↓
+The outcome is recorded: verified green, still failing, or unverified
 ```
 
 Watchtower does not call an LLM API directly. AO owns coding-agent authentication, isolated worktrees, PR ownership, and agent execution. Watchtower owns event intake, policy, approval, idempotency, and auditing. It uses only AO's public `ao` CLI and never reads or modifies AO's private database.
 
 ## What is implemented
 
-- One self-hosted Go binary with no frontend build step
+- One self-hosted Go binary with no frontend build step, on Linux, macOS, and Windows
 - One-command setup for an existing GitHub repository
 - GitHub check polling through the user's authenticated `gh` CLI
 - Optional verified `check_suite.completed` webhook intake
@@ -34,8 +36,16 @@ Watchtower does not call an LLM API directly. AO owns coding-agent authenticatio
 - Review mode with explicit approval
 - Opt-in auto-fix for high-confidence code diagnoses
 - Scoped test, commit, and non-force push to the existing PR branch
+- **Repair verification**: the repair commit is watched until CI settles, and the
+  outcome is recorded as verified green, still failing, or unverified
+- **Repository-owned policy** in `.watchtower.json`: path allowlists, denylists,
+  a confidence floor, and a blast-radius limit that automation cannot loosen
+- **Runaway guardrails**: a concurrent-investigation limit and a rolling daily
+  fix budget, with held-back triggers replayed rather than dropped
+- **Pull request comments** (opt-in) carrying the diagnosis and the final outcome
 - Closed, merged, moved-head, ownership, and duplicate-dispatch safeguards
-- Durable SQLite audit ledger and local dashboard
+- Auditable single-shot retry for a dispatch that failed to reach AO
+- Durable SQLite audit ledger, a local dashboard, and `watchtower stats`
 - Global automation kill switch
 
 The detailed behavioral contract is in [docs/MVP.md](docs/MVP.md).
@@ -311,8 +321,10 @@ The PR remains open for human review and merging.
 watchtower up [options]       # initialize if necessary, then monitor
 watchtower init [options]     # initialize without starting the server
 watchtower status [options]   # show repository, AO project, URL, and health
+watchtower stats [options]    # show durable repair outcomes for this repository
 watchtower serve -config FILE # run continuously reachable webhook mode
 watchtower demo               # run a fake-AO UI demonstration
+watchtower version
 watchtower help
 ```
 
@@ -325,10 +337,109 @@ Useful `up` options:
 --auto-fix                  enable repository-scoped automatic repair
 --auto-fix-confidence N     required confidence from 0 through 1
 --auto-fix-actor NAME       audit identity for automatic approvals
+--comment                   publish the diagnosis and outcome on the pull request
+--max-investigations N      concurrent AO investigators; default 3, 0 disables the limit
+--daily-fix-budget N        automatic fixes per rolling 24h; default 20, 0 disables
+--verify-timeout DURATION   how long to watch a repair before recording it unverified
 --ao PATH                   explicit AO executable
 --gh PATH                   explicit GitHub CLI executable
 --state-dir PATH            explicit private state directory
 ```
+
+## Did the fix actually work?
+
+A dispatched repair is not the end of the story. When AO pushes to the PR branch,
+Watchtower keeps watching that pull request and settles the repair against the new
+head commit:
+
+| Outcome | Meaning |
+| --- | --- |
+| `verified_green` | CI completed successfully on the repair commit |
+| `still_failing` | CI still failed on the repair commit |
+| `abandoned` | `--verify-timeout` expired first: the PR was closed, no repair commit arrived, or the conclusion never settled |
+
+The dashboard shows this as the row's status, and `watchtower stats` aggregates it:
+
+```sh
+watchtower stats
+```
+
+```text
+Repository: octocat/calculator
+Failures seen:        14
+Investigated:         14 (0 claim conflicts)
+Valid diagnoses:      12
+Approved:             9
+Fixes dispatched:     9
+Verified green:       7
+Still failing:        1
+Unverified:           1 (0 awaiting)
+Repair success rate:  88%
+Median time to green: 6m12s
+```
+
+Verification reuses the poll the monitor already performs, so it costs no extra
+GitHub API budget.
+
+## Repository policy
+
+Auto-fix lets an agent modify code. A repository can constrain that itself by
+committing `.watchtower.json` at its root:
+
+```json
+{
+  "version": 1,
+  "autoFix": {
+    "minimumConfidence": 0.9,
+    "allowedPaths": ["internal/**", "cmd/**"],
+    "deniedPaths": [".github/**", "**/*.tf", "internal/billing/**"],
+    "allowedCategories": ["code"],
+    "requireEvidenceFile": true,
+    "maxEvidenceFiles": 5
+  }
+}
+```
+
+Rules:
+
+- Every field is optional; a missing file means no repository constraint at all.
+- A policy may only **tighten** the operator's flags, never loosen them. The
+  effective confidence floor is the stricter of the file and `--auto-fix-confidence`.
+- `deniedPaths` beats `allowedPaths`. Patterns support `**` for any depth and `*`
+  within one path segment.
+- Evidence paths come from an agent and are treated as hostile: absolute paths,
+  `..` traversal, and backslash paths are denied rather than normalized.
+- A malformed policy is a startup error. A repository that clearly intended a
+  policy is never silently downgraded to permissive.
+
+Refusals are logged and the diagnosis stays in the dashboard for a human to
+approve deliberately.
+
+## Limits
+
+Twenty failing pull requests should not become twenty coding-agent sessions.
+
+- `--max-investigations` (default 3) bounds concurrent AO investigators. A trigger
+  held back keeps its durable reservation and is replayed automatically once
+  capacity frees up — the same mechanism also recovers a reservation whose process
+  stopped before it reached AO. An investigator that never submits a diagnosis
+  stops counting against the limit after 30 minutes, so a crashed session cannot
+  hold a slot forever; the stalled attempt stays in the audit trail.
+- `--daily-fix-budget` (default 20) bounds how many automatic fixes may be
+  dispatched in a rolling 24 hours. It is checked immediately before each dispatch,
+  so a burst of eligible diagnoses cannot overshoot it.
+
+## Pull request comments
+
+```sh
+watchtower up --auto-fix --comment
+```
+
+Watchtower posts the validated diagnosis to the pull request and later edits in
+its own outcome comment, through the same `gh` login it already uses. Comments are
+idempotent: rerunning never produces a duplicate. Agent-authored text is
+neutralized before publication, so a diagnosis cannot forge Watchtower's own
+comment markers.
 
 ## Local state
 
@@ -339,6 +450,12 @@ By default, Linux state is stored at:
 ├── state.json       # mode 0600; contains local secrets and AO mapping
 └── watchtower.db    # durable event and action ledger
 ```
+
+macOS uses `~/Library/Application Support/ao-watchtower/…` and Windows uses
+`%AppData%\ao-watchtower\…`. Windows has no POSIX mode bits, so the equivalent
+protection is an explicit access control list granting only the current user;
+Watchtower applies it on write and refuses to load state that any other account
+can reach.
 
 Do not commit or share `state.json`. The dashboard admin token is printed on startup. Investigator callback tokens are scoped to one trigger and authorize diagnosis submission only; they cannot approve fixes, change the kill switch, or invoke other dashboard mutations.
 
@@ -496,12 +613,17 @@ Important packages:
 | `internal/polling` | Reads narrow open-PR check facts through `gh` |
 | `internal/github` | Verifies and normalizes GitHub check-suite events |
 | `internal/policy` | Evaluates the CI-failure investigator rule |
-| `internal/ledger` | Stores idempotent events, diagnoses, approvals, and sends |
+| `internal/repopolicy` | Parses and applies the committed `.watchtower.json` policy |
+| `internal/ledger` | Stores idempotent events, diagnoses, approvals, sends, and outcomes |
 | `internal/ao` | Executes the public `ao` CLI using bounded argv-only calls |
 | `internal/service` | Coordinates investigation, validation, approval, and repair |
+| `internal/scheduler` | Replays reservations that capacity or a restart left unspawned |
+| `internal/verification` | Settles whether a dispatched repair turned CI green |
 | `internal/automation` | Applies the explicit high-confidence auto-fix policy |
+| `internal/prcomment` | Publishes findings to the pull request through `gh` |
+| `internal/notify` | Decides what reaches the pull request and when |
 | `internal/onboarding` | Discovers GitHub/AO state and creates private local setup |
-| `internal/web` | Serves the dashboard, approval API, and kill switch |
+| `internal/web` | Serves the dashboard shell, state API, approval API, and kill switch |
 
 ## Contributing
 
@@ -529,6 +651,6 @@ Engineering boundaries are documented in [AGENTS.md](AGENTS.md). In particular:
 
 ## Current scope
 
-The MVP intentionally focuses on one high-value workflow: **failed GitHub PR CI → AO investigation → validated diagnosis → supervised repair**.
+Watchtower intentionally focuses on one high-value workflow: **failed GitHub PR CI → AO investigation → validated diagnosis → supervised repair → verified outcome**.
 
-It does not yet provide GitLab support, hosted multi-tenancy, a general workflow language, automatic merging, or direct model-provider integration. Keeping this boundary narrow makes the demo understandable and the automation auditable.
+It does not yet provide GitLab support, hosted multi-tenancy, a general workflow language, automatic merging, monitoring several repositories from one process, or direct model-provider integration. Keeping this boundary narrow makes the demo understandable and the automation auditable.

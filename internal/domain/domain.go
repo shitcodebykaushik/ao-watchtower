@@ -2,12 +2,20 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
 const InvestigateCIFailureRule = "investigate-ci-failure"
+
+// ErrInvestigationDeferred reports that a reserved trigger was intentionally
+// held back rather than failed. The reservation stays durable and is replayed
+// once capacity frees up, so intake must treat it as an accepted event rather
+// than an intake error. It lives in domain so the intake and service packages
+// can agree on it without depending on each other.
+var ErrInvestigationDeferred = errors.New("investigation deferred")
 
 // Repository identifies a GitHub repository independently of a local checkout.
 type Repository struct {

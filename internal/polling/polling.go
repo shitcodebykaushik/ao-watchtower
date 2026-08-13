@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -155,6 +156,18 @@ func aggregate(checks []struct {
 	return conclusion, details, true
 }
 
+// Observer receives every completed observation from one poll cycle. It lets
+// downstream features such as fix verification reuse the reads the poller
+// already performs instead of spending additional GitHub API budget.
+type Observer interface {
+	Observe(context.Context, domain.Repository, []Observation) error
+}
+
+// Options carries the optional poller collaborators.
+type Options struct {
+	Observer Observer
+}
+
 type Poller struct {
 	client     *Client
 	repository domain.Repository
@@ -162,9 +175,10 @@ type Poller struct {
 	handler    http.Handler
 	interval   time.Duration
 	logger     *log.Logger
+	observer   Observer
 }
 
-func New(client *Client, repository domain.Repository, secret []byte, handler http.Handler, interval time.Duration, logger *log.Logger) (*Poller, error) {
+func New(client *Client, repository domain.Repository, secret []byte, handler http.Handler, interval time.Duration, logger *log.Logger, options ...Options) (*Poller, error) {
 	if client == nil || handler == nil || len(secret) == 0 {
 		return nil, fmt.Errorf("polling client, signed handler, and secret are required")
 	}
@@ -177,7 +191,14 @@ func New(client *Client, repository domain.Repository, secret []byte, handler ht
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Poller{client: client, repository: repository, secret: append([]byte(nil), secret...), handler: handler, interval: interval, logger: logger}, nil
+	if len(options) > 1 {
+		return nil, fmt.Errorf("only one poller option is supported")
+	}
+	var option Options
+	if len(options) == 1 {
+		option = options[0]
+	}
+	return &Poller{client: client, repository: repository, secret: append([]byte(nil), secret...), handler: handler, interval: interval, logger: logger, observer: option.Observer}, nil
 }
 
 func (p *Poller) Run(ctx context.Context) {
@@ -194,15 +215,28 @@ func (p *Poller) Run(ctx context.Context) {
 	}
 }
 
+// PollOnce delivers every completed observation and then hands the whole cycle
+// to the observer. One unusable pull request must not stop the rest of the
+// repository from being processed, so failures are collected rather than
+// returned on the first error.
 func (p *Poller) PollOnce(ctx context.Context) error {
 	observations, err := p.client.ListCompleted(ctx, p.repository)
 	if err != nil {
 		return err
 	}
+	var failures []string
 	for _, observation := range observations {
 		if err := p.deliver(ctx, observation); err != nil {
-			return err
+			failures = append(failures, fmt.Sprintf("pull %d: %v", observation.PullNumber, err))
 		}
+	}
+	if p.observer != nil {
+		if err := p.observer.Observe(ctx, p.repository, observations); err != nil {
+			failures = append(failures, fmt.Sprintf("observe: %v", err))
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
 	}
 	return nil
 }
